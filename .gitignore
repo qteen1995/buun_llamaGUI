@@ -1,0 +1,20 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.spec
+
+# PyInstaller build / dist artifacts (built exes are shipped via GitHub Releases)
+build/
+dist/
+
+# Runtime user data (config, logs)
+config/
+*.log
+
+# Local project metadata / agent memory
+.workbuddy/
+
+# Editor / OS junk
+*.swp
+Thumbs.db
+.DS_Store
