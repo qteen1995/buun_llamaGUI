@@ -4,16 +4,6 @@
 只用 Python 标准库的 tkinter，**不需要 pip 安装任何东西**；也可以打包成单文件 exe 便携运行。
 
 ![模型库](docs/preview-1-library.png)
-![服务页](docs/preview-2-server.png)
-![KV / VBR](docs/preview-3-kv-vbr.png)
-![VBR 下限挡位](docs/preview-6-vbr-floor.png)
-![运行状态条](docs/preview-7-status-bar.png)
-![推测解码](docs/preview-4-spec.png)
-
-> ⚠️ **这是 ik_llama.cpp 启动器的另一个独立副本，两份互不影响、也不共用代码。**
-> 两套引擎的参数集差别很大（buun 独有的 VBR / TurboQuant / TCQ 一整套，
-> ik 独有的 `-mla` / `-fmoe` / `-rtr` 那一批），所以**不要在两个项目之间互相拷
-> `schema.py`** —— 拷过去会立刻出现「界面勾了、引擎不认」的启动失败。
 
 ---
 
@@ -27,7 +17,7 @@
   控制 API、`/v1/*`、内置 WebUI 全在这里。
 - **对话 / 生成**：终端里跑 `llama-cli`（多轮对话）或 `llama-completion`（一次性生成）。
 - **参数页**：加载参数、对话参数、推测解码（三者都**跟模型走**）；
-  服务页与两个运行模式各自一套运行参数。
+  服务页（OpenAI 兼容 HTTP）与对话页（llama-cli 多轮 / llama-completion 一次性）各自一套运行参数。
 
 ## 运行
 
@@ -55,11 +45,10 @@ E:\Python\Python311\python.exe build_portable.py
 config/
   app.json                 软件级设置：引擎路径、模型目录、界面偏好、控制 API、运行参数
   models/
-    Huihui-Qwen3.8-27B-abliterated.json     每个「配过参数的模型」一个文件
-    Qwen3-30B-A3B-Instruct-IQ4_KSS.json
+    <模型名A-27B>.json     每个「配过参数的模型」一个文件
+    <模型名B-MoE>.json
   cache/
     scan.json              模型库扫描缓存（GGUF 元数据，可随时删掉重建）
-  router-preset.ini        多模型路由的预置文件（用「导出路由预置 INI」生成）
   selftest.log             自检输出
 ```
 
@@ -70,52 +59,6 @@ config/
 - 老的单文件 `config.json` 会在首次启动时**自动拆分**，原件改名成
   `config.legacy.json` 留退路（内容一字不改，想回滚直接改回 `config.json`）。
   拆分结果会写进启动日志。
-
----
-
-## 两种运行方式（服务页）
-
-| | 单模型网关（默认） | 多模型路由 |
-|---|---|---|
-| llama-server | 只加载一个模型、绑内部端口 | 带 `--models-dir` / `--models-preset`，自己驻留多个 |
-| 换模型 | 本程序做网关：抢锁 → 卸旧的 → 装新的 → 等就绪 | llama-server 自己按 `model` 名路由 |
-| 网关的角色 | 模型名翻译 + 自动切换 + 控制 API | **纯透传**（不再插手换模型） |
-| 适合 | 「主要用一个模型，偶尔换」 | 「一次会话里要切好几个模型」 |
-
-两种方式互斥：路由模式下「按请求自动加载 / 切换」会被忽略，界面里也会说明。
-
-### 路由模式的模型来源：优先用预置文件
-
-**推荐 `--models-preset`，不要用 `--models-dir`。** 后者的扫描规则很窄
-（见 `common/preset.cpp` 的 `load_from_models_dir`）：
-
-- 只认**顶层散放的 `.gguf`**，或**一层子目录**（`<目录>/<模型名>/*.gguf`，目录名 = 模型名）；
-- 像 `E:\LM_models\<发布者>\<模型名>\x.gguf` 这种**两层结构，它一个都扫不到**。
-
-而预置 INI 里 `model = <任意深度的路径>`，段名就是客户端请求里要写的模型名，
-还能顺手把「每个模型自己的加载参数」写进去。
-
-服务页右上角有 **「导出路由预置 INI」** 按钮，生成的内容长这样：
-
-```ini
-; 段名 = 请求里 model 字段要写的名字
-[*]                                  ← 全局段，对所有模型生效
-ctx-size = 32768
-n-gpu-layers = 999
-cache-type-k = vbr
-
-[Qwen3.8-27B-Uncensored-Heretic-v3]  ← 段名就是模型 id
-model = E:\LM_models\...\xxx.gguf
-ctx-size = 100000
-cache-type-k = turbo3_tcq
-```
-
-键写去掉 `--` 的长参数名（也认 `LLAMA_ARG_XXX` 环境变量名）。导出后把路径填进
-「路由预置文件」，启动即可。
-
-> **重要**：路由模式下命令行上的参数**不会传给各个模型**（子进程的 args 是从预置
-> 生成的，只有 `[*]` 全局段会合并进去）。所以模型参数必须写进预置文件 ——
-> 导出功能就是干这个的。
 
 ---
 
@@ -138,8 +81,8 @@ cache-type-k = turbo3_tcq
    就是引擎的默认行为（隐式 t4 地板）。
 2. **turbo / TCQ / VBR 的 KV block 是 128 个值**，要求模型 `n_embd_head_k`
    能被 128 整除，并且必须开 `-fa`。
-   - `Qwen3` 系、`Gemma4`、多数 7B+ 模型 head_dim 是 128 / 256 → 没问题；
-   - `bert` 系（如 bge-small，head_dim=64）和部分小模型 → 会直接报
+   - 主流大模型系列（Qwen / Gemma 等）、多数 7B+ 模型 head_dim 是 128 / 256 → 没问题；
+   - 部分小模型（如某些嵌入模型，head_dim=64）→ 会直接报
      `K cache type turbo4 with block size 128 does not divide n_embd_head_k=64`；
    - **而且因为默认就是 vbr，什么都不设也会踩到。** 启动器会读 GGUF 里的
      head_dim 提前拦住，并告诉你把 K/V 两侧显式设成 `q8_0` 之类。
@@ -205,7 +148,7 @@ f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq
 3. KV 成本按 **「最低档位下限」那一档的单价**计价；
 4. 缩到刚好装下为止，下限是「自动时的下限」（`--fit-ctx`，默认 4096）。
 
-**实测（27B，可用显存 4875 MiB）** —— 这条链把「下限」和「能开多长」绑在一起：
+**实测（以某 27B 模型为例，可用显存 4875 MiB）** —— 这条链把「下限」和「能开多长」绑在一起：
 
 | `--vbr-floor` | 引擎自动算出的 n_ctx |
 |---|---|
@@ -256,10 +199,9 @@ f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq
 > `mmproj GPU swap is unavailable for this external draft type; keeping both resident`。
 > 只有 `llama-server` 有这个参数。
 
-### 推测解码：和 ik 完全不是一套接口
+### 推测解码接口
 
-- `--spec-type` 收的是**逗号分隔的类型名列表**，可以同时挂多种；
-  **不支持** ik 那种 `--spec-type dflash:n_max=4` 的内联写法。
+- `--spec-type` 收的是**逗号分隔的类型名列表**，可以同时挂多种。
   认这些名字：`draft-simple` `draft-eagle3` `draft-mtp` `draft-dflash`
   `draft-dspark` `dflash` `ngram-simple` `ngram-map-k` `ngram-map-k4v`
   `ngram-mod` `ngram-cache` `suffix` `copyspec` `recycle`
@@ -276,35 +218,7 @@ f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq
 ### 推理强度是原生参数
 
 本 build 有 `--reasoning-effort LEVEL`（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），
-不需要 ik 那边「塞进 `--chat-template-kwargs` 走模板变量」的做法。
-请求体里的顶层 `reasoning_effort` 引擎也原生支持，网关原样透传。
-
----
-
-## 两个启动器的差异（为什么参数表不能共用）
-
-| | ik_llama.cpp | buun-llama-cpp |
-|---|---|---|
-| `llama-server` flag 数 | 406（**和 cli 完全相同**） | 461 |
-| `llama-cli` flag 数 | 406 | 375（少了整批推测解码 / 多模态） |
-| `llama-completion` | 无 | 272，**它有 `-cnv` / `-i`，而 cli 没有** |
-| 本启动器的参数项 | 96 | 119 |
-
-buun 独有的：VBR 全组、turbo/TCQ 档位、`-ct` 统一档位、`--models-dir` 路由组、
-`--repack`、`--agent` / `--tools` / `--mcp-servers-*`、`--rerank` / `--embeddings`、
-`--mmproj-auto`，以及上游新加的 `--spec-ngram-*`、CPU 亲和组等。
-
-ik 独有（本启动器里已全部删除）：`-mla` `-fmoe` `-gr` `-sas` `-mqkv` `-ser`
-`-vq` `-khad` `-vhad` `-dkvc` `-rtr` `-amb` `--fit-margin` `--chunks`
-`--minilog` `-crs` `-ptcall` `--spec-autotune` `--spec-ckpt-mode`
-`--mtp-requantize-output-tensor` `--draft-params` `-dr`(=dry-run)。
-
-> 例外一：`-rtr`（run-time repack）在本 build 里对应 `--repack` / `--no-repack`，
-> 语义相同，这一项保留了下来（界面叫「权重重排」）。
->
-> 例外二（陷阱）：`-dr` 在 ik 里是 `--dry-run`，在 buun 里却是 `--docker-repo`
-> （Docker Hub 模型仓库，还要跟一个值）。所以「只算内存不加载」这一项**删掉了** ——
-> 留着就是一个会报错的坑。自检里有专门一条断言在守这类「同名不同义」。
+请求体里的顶层 `reasoning_effort` 引擎原生支持，网关原样透传。
 
 ---
 
@@ -322,8 +236,7 @@ buunllama_gui/
   scan.py                  模型库扫描与分类
   manager.py / process.py  进程生死 + 命令总线（不跨线程碰 tkinter）
   unified.py               单模型网关的调度（抢锁 / 换模型 / 等就绪 / 空闲卸载）
-  control_api.py           控制 API + /v1 网关（路由模式下退化为纯透传；
-                           转发时顺手抓 timings 喂给运行时状态）
+  control_api.py           控制 API + /v1 网关（转发时顺手抓 timings 喂给运行时状态）
   ui.py / widgets.py       界面（含底部运行状态条）
   store.py / theme.py      配置持久化（app.json + 每模型一份）/ 配色
 ```
@@ -333,7 +246,7 @@ buunllama_gui/
 1. **任何启动路径都必须走 `App.build_argv_checked()`** —— 它会按 `--help` 结果
    剔除当前 build 不认识的 flag。自检里有源码级断言守着这件事。
 2. **界面专用字段绝不能产出裸值**：没有 `flag`、没有 `argmap`、
-   `positional=False` 的字段一律 `return []`，否则「运行方式」这种值会被
+   `positional=False` 的字段一律 `return []`，否则「运行模式」这类纯界面字段的值会被
    当成位置参数塞进命令行。
 3. **删参数 / 挡位改名后要处理存档里的旧值**：`builder.valid_choice()` 负责把
    老名字退回默认挡位；`multi_value` 的字段（`--spec-type`）例外 ——
@@ -350,7 +263,7 @@ E:\Python\Python311\python.exe buun_launcher.pyw --selftest
 推测解码（类型列表 / 独立 flag / 草稿模型校验）、**turbo 128-block 兼容性**、
 **VBR 下限挡位与三条约束**、**上下文「留空=自动 / 填值=指定」**、
 **运行时状态（轮询桩后端 + 转发抓 timings + bpv 反查档位）**、
-**多模态投影三项的运行模式归属**、**路由模式与 preset INI 键名校验**、
+**多模态投影三项的运行模式归属**、
 **配置拆分（app.json + 每模型一份 + 缓存分文件 + 选择性写入 + 老配置迁移）**、
 LoRA、预设、`--help` 解析、统一端口网关端到端
 （短名翻译 / 自动切换 / 409 / 并发排队 / 真起进程 / 鉴权）。
