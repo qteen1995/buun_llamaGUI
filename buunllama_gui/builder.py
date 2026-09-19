@@ -162,14 +162,49 @@ def parse_lora(raw: Any) -> List[Tuple[str, Optional[float]]]:
     return out
 
 
-def lora_args(raw: Any) -> List[str]:
-    """一个 LoRA 条目展开成 --lora 或 --lora-scaled 两个/三个 token。"""
-    out: List[str] = []
+def lora_items(raw: Any) -> Tuple[List[str], List[Tuple[str, float]]]:
+    """(比例=1.0 的路径列表, [(路径, 非 1.0 的比例)])。"""
+    plain: List[str] = []
+    scaled: List[Tuple[str, float]] = []
     for path, scale in parse_lora(raw):
         if scale is None or abs(scale - 1.0) < 1e-9:
-            out += ["--lora", path]
+            plain.append(path)
         else:
-            out += ["--lora-scaled", path, ("%g" % scale)]
+            scaled.append((path, float(scale)))
+    return plain, scaled
+
+
+def lora_args(raw: Any) -> List[str]:
+    """LoRA 展开成参数。**buun 这里是单值逗号分隔形式**：
+
+        --lora a.gguf,b.gguf              全部比例 1.0
+        --lora-scaled p:0.8,q:0.5         带比例
+
+    ⚠️ 不是上游 llama.cpp 的「--lora-scaled 路径 比例」两值写法。
+    buun 的 common/arg.cpp 里 `--lora-scaled` 的 value_hint 是
+    ``FNAME:SCALE,...``（单值），而引擎的 preset 层对**两值**参数会直接
+    throw（"argument with 2 values is not yet supported"）——
+    在路由模式下那会让整个 llama-server 起不来。所以这里必须用 CSV 形式。
+    """
+    plain, scaled = lora_items(raw)
+    out: List[str] = []
+    if plain:
+        out += ["--lora", ",".join(plain)]
+    if scaled:
+        out += ["--lora-scaled",
+                ",".join("%s:%g" % (p, s) for p, s in scaled)]
+    return out
+
+
+def lora_ini_lines(raw: Any) -> List[Tuple[str, str]]:
+    """LoRA → preset INI 的 (键, 值)。可能一次给出两行。"""
+    plain, scaled = lora_items(raw)
+    out: List[Tuple[str, str]] = []
+    if plain:
+        out.append(("lora", ",".join(plain)))
+    if scaled:
+        out.append(("lora-scaled",
+                    ",".join("%s:%g" % (p, s) for p, s in scaled)))
     return out
 
 
@@ -223,10 +258,6 @@ def valid_choice(f: S.F, raw: str) -> str:
     """
     if not raw:
         return ""
-    # multi_value（如 --spec-type 的逗号列表）：整体必然不在 choices 里，
-    # 一律原样保留，交给 validate 逐个名字报「不认识」。
-    if f.multi_value:
-        return raw
     if not f.choices or raw in f.choices:
         return raw
     default = str(f.default_value() or "")
@@ -243,13 +274,9 @@ def _field_args(f: S.F, on: bool, value: Any) -> List[str]:
     if f.kind == S.K_BOOL:
         return [f.flag] if f.flag else []
 
-    # LoRA：一个条目可能展开成 --lora 或 --lora-scaled
+    # LoRA：buun 是单值 CSV 形式（--lora a,b / --lora-scaled p:0.8）
     if f.key == "lora":
         return lora_args(raw)
-    # --spec-draft-replace TARGET DRAFT 要两个值，界面上用空格分隔
-    if f.key == "spec_draft_replace":
-        parts = _two_value_split(raw)
-        return ([f.flag] + parts) if len(parts) == 2 else []
     if f.kind == S.K_META:
         return []                  # 只用于界面组装，本身不产出参数
 
@@ -292,12 +319,6 @@ def _field_args(f: S.F, on: bool, value: Any) -> List[str]:
     return [f.flag, raw] if f.flag else [raw]
 
 
-def _two_value_split(raw: str) -> List[str]:
-    """把「A B」拆成两个 token（支持引号）。--spec-draft-replace 要两个值。"""
-    parts = _split_line(raw)
-    return parts[:2]
-
-
 def build_argv(snapshot: Dict[str, Dict[str, Any]], mode: str,
                model: str = "", role: str = "llm",
                flags: Optional[set] = None) -> List[str]:
@@ -313,7 +334,10 @@ def build_argv(snapshot: Dict[str, Dict[str, Any]], mode: str,
     参数表里移除；测速 / 量化 / imatrix 三个模式也已整体删除。
     """
     spec_on = bool((snapshot.get("spec_enable") or {}).get("on"))
-    router = S.is_router(snapshot)
+    # 「路由」只针对 llama-server：它的模型一律由预置文件提供，命令行不带 -m。
+    # 对话 / 生成（llama-cli / llama-completion）仍是单模型单次运行，照旧带 -m。
+    router = (mode == S.ROUTER_MODE)
+    spec_method = S.spec_method_of(snapshot)
     # VBR 那一组参数只有在 KV 档位确实是 vbr 时才允许出现 ——
     # 引擎对「非 vbr 的 KV + --vbr-*」是硬报错：
     #   --vbr-* flags need a VBR cache side
@@ -332,10 +356,22 @@ def build_argv(snapshot: Dict[str, Dict[str, Any]], mode: str,
             continue
         if f.page == "server" and role not in f.roles:
             continue
-        # 路由相关的参数只在「多模型路由」下才输出，
-        # 否则 --models-dir 会把 llama-server 悄悄切成路由模式，
-        # 而网关这边还在按单模型抢锁换模型 —— 两边打架。
-        if f.key in S.ROUTER_KEYS and not router:
+        # ⚠️ 路由模式下，**模型级参数一律不上路由器的命令行**。
+        #    原因：路由会把自身的命令行转成 base_preset 再 merge 进每个模型的
+        #    预置，而 merge 是「覆盖」—— 放上去就等于把所有模型都锁成同一套参数，
+        #    各模型自己的 INI 段再也改不动它。
+        #    模型级参数（load / chat / emb / lora）统一走 preset INI 的模型段。
+        #    留在命令行上的只有服务进程自己的参数（scope=run）和纯界面状态（ui）。
+        if router and f.scope not in ("run", "ui"):
+            continue
+        # 不属于当前推测方式的细项一律**不写命令**（值仍留在配置里）。
+        # 引擎对「MTP 方式 + -md」这类组合要么报错要么打一堆无谓警告。
+        if not S.field_visible_for_spec(f, spec_method):
+            continue
+        # 两值参数在服务模式下一律不输出：路由初始化会因它直接 throw
+        # （见 schema.TWO_VALUE_FLAGS 的说明）。validate 那边也会报错拦下来，
+        # 这里再兜一层，保证命令行预览里不会出现这个必定致命的参数。
+        if router and f.flag in S.TWO_VALUE_FLAGS:
             continue
         # KV 不是 vbr 时，VBR 那一组一律不输出（引擎会拒绝启动）
         if f.key in S.VBR_KEYS and not vbr_on:
@@ -564,16 +600,51 @@ def kv_compat_notes(snapshot: Dict[str, Dict[str, Any]],
 # --------------------------------------------------------------------------- #
 
 # 这些项属于「路由服务进程本身」或纯界面状态，不该写进模型预置
+#
+# ⚠️ 注意 LoRA **不在**这个表里了：它必须写进每个模型的段。
+#    原因：路由模式下命令行上的参数会被 merge（覆盖）进所有模型，
+#    而 LoRA 是「每个模型挂自己的适配器」——放命令行就等于所有模型共用同一套。
+#    好在 buun 的 --lora / --lora-scaled 是单值 CSV 形式，INI 表达得了
+#    （见 lora_ini_lines）。
 INI_SKIP: FrozenSet[str] = frozenset((
-    "host", "port", "api_key", "webui", "auto_switch", "idle_unload",
-    "run_kind", "models_dir", "models_max", "models_preset",
-    "models_autoload", "spec_enable", "extra", "lora",
-    # 推测解码的「总开关」不是参数，但它下面所有 spec_* 都只在服务进程层面有效，
-    # 放进 per-model 段会让子进程各自带一份，反而乱
+    "host", "port", "api_key", "webui", "auto_switch",
+    "models_preset", "models_max",
+    "res_llm_max", "res_emb_max", "res_emb_uncounted",
+    "res_llm_idle", "res_emb_idle",
+    "spec_enable", "extra",
+    # 单次运行（对话 / 生成）的参数，跟服务预置无关
     "prompt", "sys_prompt", "single_turn",
     "g_prompt", "g_sys_prompt", "g_conversation", "g_interactive",
     "g_single_turn",
 ))
+
+
+def _ini_lines(f: S.F, st: Dict[str, Any],
+               snap: Optional[Dict[str, Dict[str, Any]]] = None
+               ) -> List[Tuple[str, str]]:
+    """把一个界面参数项翻成 INI 的若干 (键, 值)。
+
+    ``snap`` 给整个快照时会额外做三道闸（跟 build_argv 保持一致，
+    **必须一致**：分叉过一次就出过 bug —— INI 里写了 MTP 方式不该有的
+    草稿模型、以及 KV 不是 vbr 时的 ``--vbr-*``）：
+      1. KV 不是 vbr 就不写 ``--vbr-*`` 那一组（引擎会拒绝启动）
+      2. 不属于当前推测方式的细项不写（spec_only）
+      3. LoRA 单值 CSV 拆成 lora / lora-scaled 两行
+    """
+    if not st.get("on") or f.key in INI_SKIP:
+        return []
+    if snap is not None:
+        if f.key in S.VBR_KEYS:
+            k_eff, v_eff = effective_kv_types(snap)
+            if "vbr" not in (k_eff, v_eff):
+                return []
+        if not S.field_visible_for_spec(f, S.spec_method_of(snap)):
+            return []
+    # LoRA 一个条目可能同时产出 lora 和 lora-scaled 两行
+    if f.key == "lora":
+        return lora_ini_lines(st.get("value"))
+    k, v = _ini_value(f, st)
+    return [(k, v)] if k else []
 
 
 def _ini_value(f: S.F, st: Dict[str, Any]) -> Tuple[str, str]:
@@ -591,7 +662,13 @@ def _ini_value(f: S.F, st: Dict[str, Any]) -> Tuple[str, str]:
         argv = list((f.argmap or {}).get(valid_choice(f, raw), ()))
         if len(argv) == 2 and argv[0] == f.flag:
             return key, argv[1]
-        # 其余（自动 / 反向 flag）无法用「键 = 值」表达，交给命令行
+        if len(argv) == 1 and argv[0].startswith("--no-"):
+            # 反向开关（如「强制关闭 --no-spec-dspark-gpu-assist」）：
+            # 写 ``键 = false``，引擎的 to_args() 见到 falsey 值就会换成
+            # args_neg 那个反向 flag。没有这条，「关掉某项」在 INI 里就丢了
+            # —— 而路由模式下命令行又送不进子模型。
+            return key, "false"
+        # 空 argmap（自动 / 默认档）＝跟引擎默认一样，不用写
         return "", ""
 
     if not raw:
@@ -603,6 +680,33 @@ def _ini_value(f: S.F, st: Dict[str, Any]) -> Tuple[str, str]:
     return key, raw
 
 
+def preset_aliases(name: str, path: str) -> List[str]:
+    """这个模型除了段名以外，还该登记哪些别名。
+
+    为什么需要：客户端手里的模型名不一定等于段名 ——
+
+      * 本程序 ``GET /v1/models`` 给的是**段名**（= 模型库里的显示名）；
+      * 第三方软件（Open WebUI / Cherry / 沉浸式翻译…）常常直接用**文件名**，
+        而且会把 ``.gguf`` 一起带上；
+      * 用户手抄、老客户端缓存的清单也都是文件名。
+
+    引擎的 ``has_model()`` / ``get_meta()``（server-models.cpp:1024）**会一起
+    匹配别名**，所以把「文件名」和「去掉扩展名的文件名」写进 ``alias``，
+    各种写法都能落到同一个模型上，不用逼用户去改客户端的配置。
+
+    返回空列表表示段名已经够用（路径为空或名字恰好相同）。
+    """
+    base = os.path.basename(str(path or "").replace("\\", "/"))
+    if not base:
+        return []
+    stem = os.path.splitext(base)[0]
+    out: List[str] = []
+    for cand in (stem, base):
+        if cand and cand != name and cand not in out and "," not in cand:
+            out.append(cand)
+    return out
+
+
 def preset_ini(entries: Sequence[Tuple[str, str, Dict[str, Any]]],
                global_snap: Optional[Dict[str, Any]] = None,
                engine_hint: str = "") -> str:
@@ -610,7 +714,12 @@ def preset_ini(entries: Sequence[Tuple[str, str, Dict[str, Any]]],
 
     :param entries: ``[(模型 id, 模型文件路径, 该模型的快照), ...]``
                     模型 id 就是客户端请求里要写的 model 名。
-    :param global_snap: 写进 ``[*]`` 那一节的快照（服务级公共参数）。
+    :param global_snap: 写进 ``[*]`` 那一节的快照。**不要传某个模型的快照** ——
+                    见下面的说明。
+
+    ⚠️ 关于 ``[*]``：引擎会把命令行上的参数也 merge 进每个模型段（**覆盖**），
+    而 ``[*]`` 同样是「对所有模型生效」。所以任何**模型级**参数都不能放这两处，
+    否则多模型就退化成「所有模型共用一套参数」。模型级参数只写各自的段。
     """
     out: List[str] = [
         "; buun-llama-cpp 多模型路由 · 模型预置文件",
@@ -618,34 +727,51 @@ def preset_ini(entries: Sequence[Tuple[str, str, Dict[str, Any]]],
         ";",
         "; 段名 = 客户端请求里要写的 model 名（/v1/chat/completions 的 model 字段）",
         "; 键   = 去掉前导 -- 的长参数名，例如 ctx-size / n-gpu-layers / cache-type-k",
-        "; [*] 是全局段，它里面的项对所有模型生效。",
+        "; [*] 是全局段，它里面的项对所有模型生效（本程序默认不放模型级参数进去）。",
         "",
     ]
     if global_snap:
-        g_lines = []
+        g_lines: List[Tuple[str, str]] = []
         for f in S.FIELDS:
-            st = global_snap.get(f.key) or {}
-            k, v = _ini_value(f, st)
-            if k:
-                g_lines.append((k, v))
-        if g_lines:
-            out.append("[*]")
-            for k, v in g_lines:
-                out.append("%s = %s" % (k, v))
-            out.append("")
+            if f.scope not in ("run", "ui"):
+                continue           # 模型级参数不进 [*]
+            g_lines += _ini_lines(f, global_snap.get(f.key) or {}, global_snap)
+        out.append("[*]")
+        for k, v in g_lines:
+            out.append("%s = %s" % (k, v))
+        out.append("")
+    else:
+        out.append("[*]")
+        out.append("")
 
+    # ⚠️ 模型段只写**模型级**参数（scope = load / chat / emb）。
+    #    服务进程自己的参数（scope = run / ui）既在路由命令行上、又会跟模型段
+    #    混在一起，写进来纯属噪音 —— 而且会让人误以为模型自带一套宿主参数。
     skipped: List[str] = []
+    alias_seen: Dict[str, str] = {n: n for n, _p, _s in entries}
     for name, path, snap in entries:
         out.append("[%s]" % name)
         out.append("model = %s" % path)
+        aliases = []
+        for a in preset_aliases(name, path):
+            owner = alias_seen.get(a)
+            if owner and owner != name:
+                continue           # 跟别的模型/别名撞了 → 这个模型就让出去
+            alias_seen[a] = name
+            aliases.append(a)
+        if aliases:
+            # 引擎按逗号拆（common/arg.cpp 的 --alias）
+            out.append("alias = %s" % ",".join(aliases))
         wrote = 0
+        safe = emb_guard(path, snap)
         for f in S.FIELDS:
-            st = (snap or {}).get(f.key) or {}
-            k, v = _ini_value(f, st)
-            if not k or k == "model":
+            if f.scope not in ("load", "chat", "emb"):
                 continue
-            out.append("%s = %s" % (k, v))
-            wrote += 1
+            for k, v in _ini_lines(f, (safe or {}).get(f.key) or {}, safe):
+                if not k or k == "model":
+                    continue
+                out.append("%s = %s" % (k, v))
+                wrote += 1
         out.append("")
         if not wrote:
             skipped.append(name)
@@ -655,9 +781,79 @@ def preset_ini(entries: Sequence[Tuple[str, str, Dict[str, Any]]],
     if skipped:
         out.append("; 这些模型只写了路径（还没有自己的加载参数）：%s"
                    % ", ".join(skipped))
-    out.append("; 无法用 INI 表达的勾选项（如 -mlock、-cpu-moe、LoRA）"
-               "请留在服务页命令行上，它们对路由进程本身生效。")
     return "\n".join(out) + "\n"
+
+
+def preset_section(name: str, path: str,
+                   snap: Dict[str, Any]) -> str:
+    """单个模型的 INI 段落文本（界面上「这个模型会写进预置的内容」预览）。"""
+    lines: List[str] = ["[%s]" % name, "model = %s" % path]
+    aliases = preset_aliases(name, path)
+    if aliases:
+        lines.append("alias = %s" % ",".join(aliases))
+    if is_embedding_model(path):
+        lines.append("; （embedding 类模型：KV 档位已自动钉成 f16）")
+    safe = emb_guard(path, snap)
+    for f in S.FIELDS:
+        if f.scope not in ("load", "chat", "emb"):
+            continue
+        for k, v in _ini_lines(f, (safe or {}).get(f.key) or {}, safe):
+            if not k or k == "model":
+                continue
+            lines.append("%s = %s" % (k, v))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# 模型级快照的硬性纠正（进 INI 之前）
+#
+# 1) embedding 类模型的 KV 档位
+#    ⚠️ buun 的 ``-ctk`` / ``-ctv`` **默认值就是 vbr**，而 vbr / turbo / TCQ
+#       这一族要求 ``n_embd_head_k % 128 == 0``。bert 系（bge / gte / e5 /
+#       qwen3-embedding / embeddinggemma …）的 head_dim 是 64 —— 于是
+#       **什么都不设也会起不来**：
+#         K cache type turbo4 with block size 128 does not divide
+#         n_embd_head_k=64
+#       界面上的 vbr 组默认是勾着的，会被写进每个模型段，所以这里必须对
+#       embedding 类模型显式钉成 f16。
+# 2) ``--embedding`` 不该由用户手动勾
+#    embedding 类模型**天生**要带这个参数（不然它就只是个没用的 bert），
+#    普通对话模型则一定不能带（带上就彻底不能聊天）。所以按 GGUF 架构自动定：
+#    是 embedding 架构 → 强制开；不是 → 强制关并清掉整组 emb 参数。
+# --------------------------------------------------------------------------- #
+
+def is_embedding_model(path: str) -> bool:
+    """是不是 embedding / reranker 类模型。
+
+    用「模型库」那一套同一份判据（scan.classify）—— 因为光看架构不够：
+    ``Qwen3-Embedding-0.6B`` 的 general.architecture 就是 ``qwen3``，
+    只有从名字里的 embedding 关键字才认得出来。
+    """
+    from . import scan as _SC         # 延迟导入，避免模块循环
+    return _SC.classify(path, {"arch": _arch_of(path)}) == "Embedding"
+
+
+def emb_guard(path: str,
+              snap: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """按模型类别纠正 embedding 相关取值（返回一份副本）。"""
+    out = dict(snap or {})
+    emb = is_embedding_model(path)
+    if emb:
+        # 只有几何上真不支持的才钉 f16（head_dim 不是 128 的倍数）。
+        # 读不出 head_dim 时保守起见也钉上 —— 钉了只是多占一点 KV，不会失败。
+        hd, _src = model_head_dim(path)
+        if not hd or hd % 128:
+            for key in ("ct", "ctk", "ctv"):
+                if key in out:
+                    out[key] = {"on": True, "value": "f16"}
+        if "emb_enable" in out:
+            out["emb_enable"] = {"on": True, "value": ""}
+    else:
+        # 非 embedding 模型：整组 emb_* 一律关掉（存档里的旧值不算数）
+        for f in S.FIELDS:
+            if f.page == "emb" and f.key in out:
+                out[f.key] = {"on": False, "value": f.default_value()}
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -672,9 +868,20 @@ def _as_int(v: Any) -> Optional[int]:
 
 
 def validate(snapshot: Dict[str, Dict[str, Any]], mode: str,
-             exe: Optional[str], model: str = "", role: str = "llm"
-             ) -> List[Tuple[str, str]]:
-    """返回 [(字段 key, 错误说明)]，空列表表示通过。"""
+             exe: Optional[str], model: str = "", role: str = "llm",
+             model_checks: bool = True) -> List[Tuple[str, str]]:
+    """返回 [(字段 key, 错误说明)]，空列表表示通过。
+
+    ``model_checks=False``：跳过**针对这一个模型**的检查（文件在不在、
+    KV 档位跟它的 head_dim 搭不搭）。路由模式下必须这么用 —— 路由器进程
+    本身不加载任何模型（模型路径只写在预置文件里），拿某一个模型的参数去
+    卡整个路由器的话，那个模型配错了就谁都起不来：
+
+      * bert 系 embedding 模型的 head_dim=64，默认的 vbr 档位必然报错
+        （预置文件里已经由 ``emb_guard`` 自动钉成 f16，但用户选中的
+         「目标模型」不一定是 embedding）；
+      * 目标模型的其它参数有问题时，同理想让别的模型也一起没法用。
+    """
     errs: List[Tuple[str, str]] = []
 
     if not exe:
@@ -682,11 +889,12 @@ def validate(snapshot: Dict[str, Dict[str, Any]], mode: str,
                      "没有找到可执行文件。请先在顶部「引擎目录」里选择 "
                      "buun-llama-cpp 的目录或某个 .exe。"))
 
-    if not model:
-        errs.append(("__model__",
-                     "还没有选定模型。请先在「模型库」里选一个模型。"))
-    elif not os.path.isfile(model):
-        errs.append(("__model__", "模型文件不存在：%s" % model))
+    if model_checks:
+        if not model:
+            errs.append(("__model__",
+                         "还没有选定模型。请先在「模型库」里选一个模型。"))
+        elif not os.path.isfile(model):
+            errs.append(("__model__", "模型文件不存在：%s" % model))
 
     for f in S.FIELDS:
         if mode not in f.modes:
@@ -720,25 +928,57 @@ def validate(snapshot: Dict[str, Dict[str, Any]], mode: str,
                                 "请把 fit 改回「自动」，或取消 -ngl。"))
 
     if mode in ("server", "cli") and (snapshot.get("spec_enable") or {}).get("on"):
-        st_st = snapshot.get("spec_type") or {}
-        stype = str(st_st.get("value", "")).strip() if st_st.get("on") else ""
-        names = S.spec_type_names(stype)
-        md_st = snapshot.get("model_draft") or {}
-        draft = str(md_st.get("value", "")).strip() if md_st.get("on") else ""
-        need = [t for t in names if t in S.SPEC_NEEDS_DRAFT]
-        if need and not draft:
-            errs.append(("model_draft",
-                         "推测方式「%s」需要指定草稿模型（-md）。"
-                         "不需要草稿模型的写法是 draft-mtp 与 ngram-* / suffix。"
-                         % ",".join(need)))
-        unknown = [t for t in names if t not in S.SPEC_TYPES]
-        if unknown:
+        method = S.spec_method_of(snapshot)
+        if method not in S.SPEC_METHODS:
             errs.append(("spec_type",
-                         "本 build 不认识这些推测方式：%s。可选：%s"
-                         % (",".join(unknown), ", ".join(S.SPEC_TYPES))))
+                         "本程序只保留三种推测方式：%s。"
+                         % "、".join(S.SPEC_METHODS)))
+        elif method in S.SPEC_NEEDS_DRAFT:
+            md_st = snapshot.get("model_draft") or {}
+            draft = str(md_st.get("value", "")).strip() if md_st.get("on") else ""
+            if not draft:
+                errs.append(("model_draft",
+                             "推测方式「%s」需要指定草稿模型（-md）。\n"
+                             "只有 MTP 不需要 —— 它用的是主模型自带的 MTP 层。"
+                             % method))
+            elif model and os.path.isfile(model) \
+                    and _model_has_mtp(model) is True:
+                # 主模型自带 MTP 头，又配外部 DFlash/DSpark 草稿：内置 MTP 头会和
+                # 外部草稿打架，引擎启动该模型子进程时会在 fit 阶段报
+                # 「failed to measure a required speculative model/context」。
+                errs.append(("spec_type",
+                             "请改用 MTP 方式（spec-type=draft-mtp），"
+                             "不需要额外草稿（-md 也清掉）。\n"
+                             "原因：主模型自带 MTP 预测头（GGUF 里 %s.nextn_predict_layers "
+                             ">0），选 %s 会跟内置 MTP 头冲突，触发引擎\n"
+                             "「failed to measure a required speculative "
+                             "model/context」这条 fit 警告。"
+                             % (_arch_of(model), method)))
+        else:
+            # MTP：主模型必须真有 MTP 层，否则引擎只会打一行 warning 然后跳过
+            if model and os.path.isfile(model):
+                if not _model_has_mtp(model):
+                    errs.append(("spec_type",
+                                 "这个模型没有 MTP 预测头（GGUF 里 %s.nextn_predict_layers "
+                                 "为空或 0），选 MTP 方式会被引擎静默跳过、完全不加速。\n"
+                                 "请换一个带 MTP 的模型，或改用 DFlash / DSpark "
+                                 "并指定草稿模型。" % _arch_of(model)))
+
+    # ⚠️ 两值参数绝对不能进服务命令行：路由初始化会把命令行自身转成
+    #    base_preset（common_params_to_map），遇到两值参数直接 throw，
+    #    整个 llama-server 起不来（实测：failed to initialize router models）。
+    if mode == "server":
+        bad = [f.flag for f in S.FIELDS
+               if f.flag in S.TWO_VALUE_FLAGS
+               and (snapshot.get(f.key) or {}).get("on")]
+        if bad:
+            errs.append(("__engine__",
+                         "这些参数是一次要两个值的，路由模式不支持：%s\n"
+                         "（引擎的 preset 层会直接抛异常，服务起不来）"
+                         % "、".join(bad)))
 
     # turbo / TCQ / VBR 的 128-block 限制（读 GGUF 拿 head_dim）
-    if model and os.path.isfile(model):
+    if model_checks and model and os.path.isfile(model):
         errs += kv_compat_errors(snapshot, model)
 
     # VBR 下限与起始档位 / 阶梯的约束
@@ -746,19 +986,61 @@ def validate(snapshot: Dict[str, Dict[str, Any]], mode: str,
 
     # 路由模式必须有模型来源，否则 llama-server 起来了也一个模型都没有
     if S.is_router(snapshot):
-        md = snapshot.get("models_dir") or {}
         mp = snapshot.get("models_preset") or {}
-        has_dir = bool(md.get("on") and str(md.get("value") or "").strip())
         has_ini = bool(mp.get("on") and str(mp.get("value") or "").strip())
-        if not (has_dir or has_ini):
-            errs.append(("models_dir",
-                         "「多模型路由」需要一个模型来源：\n"
-                         "· 填「路由模型目录」（目录结构必须是 <目录>/<模型名>/*.gguf "
-                         "或顶层散放的 .gguf），或\n"
-                         "· 用「导出路由预置 INI」生成一个预置文件填到"
-                         "「路由预置文件」里 —— 它能覆盖任意深度的目录结构，"
-                         "还能给每个模型带上自己的参数。"))
+        if not has_ini:
+            errs.append(("models_preset",
+                         "路由需要一个模型来源：本程序会自动生成预置文件"
+                         "（config/router-preset.ini）并把路径填进「路由预置文件」。\n"
+                         "如果这里是空的，说明生成失败了（一般是被杀毒软件锁住"
+                         "或配置目录不可写）—— 检查一下 config 目录。"))
     return errs
+
+
+# --------------------------------------------------------------------------- #
+# 模型能力探测（MTP 判据）
+# --------------------------------------------------------------------------- #
+
+def _head_kv(path: str) -> Tuple[Dict[str, Any], str]:
+    """读 GGUF 头，返回 (元数据, architecture)。读不出来给 ({}, "")。"""
+    if not path or not os.path.isfile(path):
+        return {}, ""
+    try:
+        from . import gguf as _G          # 延迟导入，避免模块循环
+        kv, _ = _G.read_header(path, want_tensors=False)
+    except Exception:  # noqa: BLE001
+        return {}, ""
+    if not isinstance(kv, dict):
+        return {}, ""
+    return kv, str(kv.get("general.architecture") or "")
+
+
+def _arch_of(path: str) -> str:
+    """从 GGUF 读出 general.architecture（读不出来就返回空串）。"""
+    return _head_kv(path)[1]
+
+
+def _model_has_mtp(path: str) -> Optional[bool]:
+    """这个模型有没有 MTP（NextN）预测头。
+
+    判据是 GGUF 元数据里的 ``{arch}.nextn_predict_layers`` —— 引擎自己就是用
+    这个键决定要不要建 NextN 层的（见 llama-model.cpp:1462）。
+    **不要拿文件名里有没有 mtp / nextn 去猜**：实测这一批 27B 里，
+    ``Huihui-...-abliterated`` / ``SexyGPT`` / ``Signal`` 名字里都没有 MTP，
+    但 nextn_predict_layers 都是 1。
+    返回 None 表示读不出（文件不存在 / 不是 GGUF）。
+    """
+    kv, arch = _head_kv(path)
+    if not arch:
+        return None
+    try:
+        raw = kv.get("%s.nextn_predict_layers" % arch)
+    except AttributeError:
+        return None
+    try:
+        return int(raw) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def write_ini(path: str, text: str) -> bool:

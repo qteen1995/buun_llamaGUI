@@ -38,15 +38,16 @@ START_TIMEOUT = 30.0      # 交给主线程「起进程」这一步的等待上�
 class UnifiedBackend:
     """统一端口模式下的模型调度器。"""
 
+    # 空闲卸载**不在这里**了：多模型路由下由 router.RouterMonitor 按
+    # LLM / Embedding 两套独立计时做（它还知道每个模型最后一次被用是什么时候 ——
+    # 引擎的 GET /models 不返回 last_used，只有网关转发时才记得到）。
     def __init__(self, mgr, bus,
                  status_fn: Callable[[], Dict[str, Any]],
-                 idle_minutes_fn: Callable[[], int],
                  enabled_fn: Callable[[], bool],
                  log_fn: Optional[Callable[[str, str], None]] = None) -> None:
         self.mgr = mgr
         self.bus = bus
         self.status_fn = status_fn
-        self.idle_minutes_fn = idle_minutes_fn
         self.enabled_fn = enabled_fn
         self.log_fn = log_fn or (lambda msg, tag="": None)
         self.lock = threading.Lock()
@@ -58,7 +59,6 @@ class UnifiedBackend:
         self.started_at = 0.0
         self.switches = 0
         self.waiters = 0           # 正在排队的请求数（仅用于展示）
-        self._idle_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------- 状态
     @property
@@ -92,7 +92,6 @@ class UnifiedBackend:
             "port": self.port,
             "running": self.running(),
             "idle_seconds": round(time.time() - self.last_used, 1),
-            "idle_unload_minutes": self.idle_minutes_fn(),
             "switches": self.switches,
             "queued": self.waiters,
         }
@@ -224,30 +223,3 @@ class UnifiedBackend:
             time.sleep(READY_POLL)
         return False, "等待模型就绪超时（%s）" % (last or "无响应")
 
-    # --------------------------------------------------------- 空闲卸载
-    def start_idle_watch(self) -> None:
-        if self._idle_thread and self._idle_thread.is_alive():
-            return
-
-        def loop() -> None:
-            while True:
-                time.sleep(15)
-                try:
-                    minutes = int(self.idle_minutes_fn() or 0)
-                except Exception:  # noqa: BLE001
-                    minutes = 0
-                if minutes <= 0 or not self.model or not self.running():
-                    continue
-                if self.lock.locked():
-                    continue
-                if time.time() - self.last_used >= minutes * 60:
-                    self.log_fn("空闲超过 %d 分钟，自动卸载 %s 以释放显存"
-                                % (minutes, self._short(self.model)), "warn")
-                    try:
-                        self.unload("空闲超时")
-                    except Exception:  # noqa: BLE001
-                        pass
-
-        self._idle_thread = threading.Thread(target=loop, name="idle-unload",
-                                             daemon=True)
-        self._idle_thread.start()

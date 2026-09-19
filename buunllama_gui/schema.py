@@ -5,10 +5,11 @@
 --------
 * 每个设置项由 :class:`F` 描述：中英双语标签、命令行 flag（以及 ini 用的长名）、
   控件类型、默认值、是否默认勾选、适用的运行模式、所属页面与小节。
-* **三个作用域**（scope）决定参数存在哪里：
-    - ``load``  加载参数 —— 跟着**模型**走（加载参数页 / 推测解码页）
+* **四个作用域**（scope）决定参数存在哪里：
+    - ``load``  加载参数 —— 跟着**模型**走（加载参数页 / 推测解码页 / LoRA 页）
     - ``chat``  对话参数 —— 跟着**模型**走（对话参数页）
-    - ``run``   运行参数 —— 服务页只有一套（统一端口、一个角色），
+    - ``emb``   embedding 专属参数 —— 跟着**模型**走（弹窗，只有 embedding 类模型用）
+    - ``run``   运行参数 —— 服务页只有一套（统一端口），
       「对话」模式（cli）自己一份
 * 未勾选的项 **完全不写入命令行**，所以即使某个 build 不认识这个参数也不会启动失败；
   再配合 ``--help`` 探测（probe.py）就能把不支持的项自动标出来。
@@ -33,8 +34,8 @@ MODES: Dict[str, Dict[str, str]] = {
         "zh": "服务",
         "en": "Server",
         "tip": "启动 OpenAI 兼容的 HTTP 推理服务（llama-server）。\n"
-               "统一端口：一个端口对外，按请求自动切换模型；也可以在服务页切到"
-               "「多模型路由」，让 llama-server 自己驻留多个模型。",
+               "跑的是「多模型路由」：一个进程下挂多个模型子进程，各自独立加载 / "
+               "卸载，统一端口对外。",
     },
     "cli": {
         "exe": "llama-cli",
@@ -76,6 +77,7 @@ PAGES: Tuple[Tuple[str, str, str, str], ...] = (
     ("load", "加载参数", "Load", "load"),
     ("chat", "对话参数", "Chat params", "chat"),
     ("spec", "推测解码", "Spec", "load"),
+    ("lora", "LoRA", "LoRA", "load"),
 )
 
 PAGE_ZH = {p[0]: p[1] for p in PAGES}
@@ -83,22 +85,31 @@ PAGE_EN = {p[0]: p[2] for p in PAGES}
 PAGE_KIND = {p[0]: p[3] for p in PAGES}
 PAGE_ORDER = {p[0]: i for i, p in enumerate(PAGES)}
 
+# 只在弹窗里出现的页面：不生成 ParamPage、不进侧边栏、不参与「当前页」判断。
+# 现在只有 embedding 专属参数（点模型库的「embedding 设置」弹小窗口）。
+DIALOG_PAGES: Tuple[str, ...] = ("emb",)
+PAGE_ZH["emb"] = "Embedding 参数"
+PAGE_EN["emb"] = "Embedding"
+PAGE_KIND["emb"] = "load"
+
 # 页面 -> 运行模式（编辑类页面按服务模式的参数集来拼命令行）
 PAGE_MODE = {
     "server": "server", "cli": "cli", "gen": "gen",
     "load": "server", "chat": "server", "spec": "server",
+    "lora": "server", "emb": "server",
 }
 
 # 导航分组：(组标题, 组英文, [页面 id])
 NAV_GROUPS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("模型", "Models", ("lib",)),
     ("运行模式", "Run mode", ("server", "cli", "gen")),
-    ("参数（跟随所选模型）", "Parameters", ("load", "chat", "spec")),
+    ("参数（跟随所选模型）", "Parameters", ("load", "chat", "spec", "lora")),
 )
 
 SECTIONS: Tuple[Tuple[str, str, str, str], ...] = (
+    ("server", "res", "驻留策略", "Residency"),
+    ("server", "router", "路由预置", "Router preset"),
     ("load", "basic", "基础", "Basic"),
-    ("load", "lora", "LoRA 适配器", "LoRA Adapters"),
     ("load", "perf", "性能与显存", "Performance & VRAM"),
     ("load", "kv", "KV 缓存", "KV Cache"),
     ("load", "vbr", "VBR 动态量化", "VBR Dynamic KV"),
@@ -109,18 +120,19 @@ SECTIONS: Tuple[Tuple[str, str, str, str], ...] = (
     ("chat", "sample", "采样", "Sampling"),
     ("spec", "main", "方式与草稿模型", "Method & Draft"),
     ("spec", "draft", "草稿参数", "Draft params"),
-    ("spec", "ngram", "n-gram 参数", "n-gram params"),
     ("spec", "res", "草稿模型资源", "Draft resources"),
+    ("lora", "main", "LoRA 适配器", "LoRA Adapters"),
+    ("emb", "main", "Embedding 专属", "Embedding"),
 )
 
 SECTION_ZH: Dict[Tuple[str, str], str] = {(s[0], s[1]): s[2] for s in SECTIONS}
 SECTION_EN: Dict[Tuple[str, str], str] = {(s[0], s[1]): s[3] for s in SECTIONS}
 
-# 这些小节由专门的界面组件渲染（不是普通的一行行参数）
-CUSTOM_SECTIONS: Dict[str, Tuple[str, ...]] = {"load": ("lora",)}
+# 没有「由专门界面组件渲染的小节」了：LoRA 已经从「加载参数」页搬成独立页面。
+CUSTOM_SECTIONS: Dict[str, Tuple[str, ...]] = {}
 
 # 参数页顶部会被“选中模型”上下文影响的页面
-MODEL_SCOPED_PAGES: Tuple[str, ...] = ("load", "chat", "spec")
+MODEL_SCOPED_PAGES: Tuple[str, ...] = ("load", "chat", "spec", "lora", "emb")
 
 
 def sections_for(page: str) -> Tuple[Tuple[str, str], ...]:
@@ -180,6 +192,8 @@ class F:
     scope_override: str = ""
     positional: bool = False                  # 真正的「位置参数」（如量化的输入/输出）
     multi_value: bool = False                 # 允许逗号分隔的多值（如 --spec-type）
+    hidden: bool = False                      # 不进界面（但照样参与命令行组装）
+    spec_only: Tuple[str, ...] = ()           # 只在「推测方式」选了这些挡位时才显示
 
     # -------------------------------------------------------------- 派生
     def default_value(self) -> str:
@@ -192,8 +206,10 @@ class F:
     def scope(self) -> str:
         if self.scope_override:
             return self.scope_override
-        if self.page in ("load", "spec"):
+        if self.page in ("load", "spec", "lora"):
             return "load"
+        if self.page == "emb":
+            return "emb"
         if self.page == "chat":
             return "chat"
         return "run"
@@ -307,22 +323,26 @@ VBR_TURBO_FLOORS: FrozenSet[str] = frozenset(
     v for _k, v in VBR_FLOOR_GEARS if v.startswith("turbo"))
 
 # --------------------------------------------------------------------------- #
-# 服务页的两种「运行方式」（互斥）
+# 服务只有一种运行方式：多模型路由
 #
-#   单模型网关   llama-server 只加载一个模型、绑内部端口；本程序做网关，
-#               按请求里的 model 换模型（现有行为）。
-#   多模型路由   llama-server 带 --models-dir / --models-preset 自己驻留多个
-#               模型，按 model 名路由；此时网关只做纯透传。
+#   llama-server 带 --models-preset 启动，自己按 model 名路由；每个模型一个子进程，
+#   可以单独加载 / 卸载，同时驻留几个由 --models-max 兜底、由本程序按类限流。
+#   网关（control_api）在路由模式下是**纯透传**，不再抢锁换模型。
 #
-# 两者不能叠加：路由模式下网关不再抢锁换模型。
-# --------------------------------------------------------------------------- #
-RUN_GATEWAY = "单模型网关"
-RUN_ROUTER = "多模型路由"
-RUN_KINDS: Tuple[str, ...] = (RUN_GATEWAY, RUN_ROUTER)
+#   历史上有过「单模型网关」这种互斥的运行方式（网关按请求换模型），已按用户要求
+#   整体移除 —— 一个端口、一个路由进程、多个模型子进程，就这一条路径。
+#
+# ⚠️ 「路由」只针对 llama-server。「对话」（llama-cli）和「生成」（llama-completion）
+#    仍是单模型单次运行，命令行照旧带 -m。
+ROUTER_MODE = "server"
 
-# 只有路由模式才该出现的参数项
-ROUTER_KEYS: FrozenSet[str] = frozenset(
-    ("models_dir", "models_max", "models_preset", "models_autoload"))
+
+def is_router(snapshot: Optional[Dict[str, Any]] = None) -> bool:
+    """当前是不是路由模式。现在只剩路由一种，保留函数名只为少改调用点。"""
+    return True
+
+# 路由模式下由本程序计算后写进快照的参数（不进界面，见 App._derive_residency）。
+
 
 # ⚠️ 这些参数**只在 KV 档位确实是 vbr 时才允许输出**。
 # 引擎对它们有硬校验（common/arg.cpp）：
@@ -336,18 +356,21 @@ VBR_KEYS: FrozenSet[str] = frozenset((
     "vbr_prompt_cache", "vbr_anchor_cache",
 ))
 
-
-def run_kind_of(snapshot: Dict[str, Any]) -> str:
-    """当前快照选的运行方式；认不出来就退回单模型网关。"""
-    st = (snapshot or {}).get("run_kind") or {}
-    if not st.get("on"):
-        return RUN_GATEWAY
-    val = str(st.get("value") or "").strip()
-    return val if val in RUN_KINDS else RUN_GATEWAY
-
-
-def is_router(snapshot: Dict[str, Any]) -> bool:
-    return run_kind_of(snapshot) == RUN_ROUTER
+# ⚠️ 引擎的 preset 层完全不支持「一个 flag 吃两个值」的参数：
+#     common_preset::to_args() → throw "option '%s' has two values, which is
+#                                 not supported yet"
+#     common_params_to_map()   → throw "argument with 2 values is not yet
+#                                 supported"
+# 而后一条是**路由初始化必经的一步**（路由把自身命令行转成 base_preset，
+# 再 merge 进每个模型的预置）。所以两值 flag 一旦出现在服务命令行上，整个
+# llama-server 直接起不来。实测确认：
+#     llama-server --models-preset x.ini --spec-draft-replace a b
+#     → failed to initialize router models: error: argument with 2 values is
+#       not yet supported
+# 参数表里已经没有两值项了（原 --spec-draft-replace 已删除），这道闸是防止
+# 以后又加回来 —— builder.validate 与 build_argv 都会拦。
+TWO_VALUE_FLAGS: FrozenSet[str] = frozenset(
+    ("--spec-draft-replace", "--spec-replace"))
 
 # --------------------------------------------------------------------------- #
 # 参数表
@@ -371,18 +394,16 @@ FIELDS: Tuple[F, ...] = (
            "llama-server 自己会绑到一个内部端口（自动挑空闲口），由本网关转发，"
            "所以两者不会冲突；你只需要记住这一个端口。\n"
            "第一次绑不上时会自动往下找一个能用的端口并记住它。"),
-    F("auto_switch", "按请求自动加载 / 切换", "Auto load & switch on request",
-      page="server", kind=K_BOOL, on=True, modes=frozenset({"server"}),
-      roles=_LLM_ONLY, scope_override="ui",
-      hint="打开后，请求里 model 指定的模型没在跑时：卸载当前模型 → 加载目标模型 "
-           "→ 再处理这个请求（要等加载完，模型越大越久）。\n"
-           "期间其它请求排队等待；等这次切换结束后，排队的请求再按目标模型依次进行。\n"
-           "关掉则只服务当前已加载的模型，请求别的模型直接返回 409。"),
-    F("idle_unload", "空闲自动卸载（分钟）", "Idle auto-unload (minutes)",
-      page="server", kind=K_INT, default="0", on=True,
-      modes=frozenset({"server"}), roles=_LLM_ONLY, scope_override="ui",
-      hint="连续这段时间没有收到任何推理请求，就自动卸载模型、把显存还回去；"
-           "下次有请求时再自动加载。0 = 不自动卸载。"),
+    F("auto_switch", "按请求自动加载", "Auto load on request",
+      page="server", kind=K_GEAR, default="开启", choices=("开启", "关闭"),
+      argmap={"开启": (), "关闭": ("--no-models-autoload",)},
+      ini={"开启": "true", "关闭": "false"}, long="models-autoload",
+      on=True, modes=frozenset({"server"}), roles=_LLM_ONLY,
+      scope_override="ui",
+      hint="打开后，请求里 model 指定的模型没在跑时，路由会把它加载起来再处理"
+           "（要等加载完，模型越大越久）。\n"
+           "对应引擎的 --models-autoload（默认就是开启）。\n"
+           "关掉则只有显式点「加载」才会加载模型，请求没在跑的模型会被直接拒绝。"),
     F("parallel", "最大并发预测数", "Max Concurrent Predictions (-np)",
       page="server", flag="-np", kind=K_INT, default="1", on=True,
       modes=frozenset({"server"}), roles=_LLM_ONLY, long="parallel",
@@ -406,46 +427,57 @@ FIELDS: Tuple[F, ...] = (
       roles=_ROLE_ALL,
       hint="启动时不跑一次空推理预热。首次请求会稍慢一点。"),
 
-    # ---- 运行方式：单个模型走网关，还是让 llama-server 自己挂多个模型
-    F("run_kind", "运行方式", "Run kind", page="server", kind=K_GEAR,
-      default=RUN_GATEWAY, choices=RUN_KINDS,
-      argmap={RUN_GATEWAY: (), RUN_ROUTER: ()},
-      on=True, modes=frozenset({"server"}), roles=_ROLE_ALL,
-      scope_override="ui", width=16,
-      hint="两种互斥的运行方式：\n"
-           "· 单模型网关 —— llama-server 只加载一个模型，绑内部端口；"
-           "本程序在统一端口上做网关，请求别的模型时自动换模型。\n"
-           "· 多模型路由 —— llama-server 带 --models-dir 自己驻留多个模型"
-           "（同时最多 --models-max 个），按请求里的 model 名路由；"
-           "此时网关只做透传，不再插手换模型。\n"
-           "两者不要叠加：路由模式下「按请求自动加载 / 切换」会被忽略。"),
-    F("models_dir", "路由模型目录", "Router models dir (--models-dir)",
-      page="server", flag="--models-dir", kind=K_DIR, on=False, width=34,
-      modes=frozenset({"server"}), roles=_ROLE_ALL,
-      hint="多模型路由要扫描的目录（可递归发现 .gguf）。\n"
-           "通常直接填「模型库」里那个根目录即可。"),
-    F("models_max", "路由同时驻留上限", "Router max models (--models-max)",
-      page="server", flag="--models-max", kind=K_INT, default="4", on=False,
-      modes=frozenset({"server"}), roles=_ROLE_ALL,
-      hint="路由服务同时加载几个模型（默认 4，0 = 不限制）。\n"
-           "注意它们共享同一块显存，开太多会互相挤爆。"),
+    # ---- 驻留策略（纯界面设置，不进命令行；由 App._derive_residency 翻译成
+    #      --models-max，并在网关侧按类做真正的 LRU 限流 + 空闲卸载）
+    #
+    # 为什么引擎侧只能兜底：--models-max 是**单个全局数字**，它的 LRU 驱逐不看
+    # 模型类别 —— 传了「LLM 上限」的话，embedding 一多就会被跨类踢掉。所以真正
+    # 按 LLM / Embedding 分别记账、分别顶替的是本程序（网关是所有请求的入口）。
+    F("res_llm_max", "LLM 同时驻留上限", "Max resident LLMs", page="server",
+      section="res", kind=K_INT, default="1", on=True,
+      modes=frozenset({"server"}), roles=_ROLE_ALL, scope_override="ui",
+      hint="最多同时驻留几个 LLM。超了就**自动顶掉同类里最久没被用过**的那个，"
+           "调用方基本无感。\n"
+           "默认 1 —— 一次只在显存里放一个大模型。"),
+    F("res_emb_max", "Embedding 同时驻留上限", "Max resident embeddings",
+      page="server", section="res", kind=K_INT, default="2", on=True,
+      modes=frozenset({"server"}), roles=_ROLE_ALL, scope_override="ui",
+      hint="最多同时驻留几个 embedding / reranker 模型。\n"
+           "它们通常很小，一般给 1~2 个就够；勾了下面那个选项时这一栏会被忽略。"),
+    F("res_emb_uncounted", "Embedding 不计入驻留数量",
+      "Embeddings don't count", page="server", section="res",
+      kind=K_BOOL, on=False, modes=frozenset({"server"}), roles=_ROLE_ALL,
+      scope_override="ui",
+      hint="勾上后 embedding / reranker 想驻留几个都行，完全不占 LLM 的名额。\n"
+           "⚠️ 这时引擎那边的兜底上限（--models-max）只能设成 0（不限制），"
+           "显存占用就完全靠本程序按类限流来保证。"),
+    F("res_llm_idle", "LLM 空闲释放（分钟）", "Unload idle LLMs (min)",
+      page="server", section="res", kind=K_INT, default="15", on=True,
+      modes=frozenset({"server"}), roles=_ROLE_ALL, scope_override="ui",
+      hint="LLM 连续这段时间没收到任何请求，就自动卸载、把显存还回去"
+           "（子进程整个收掉，下次请求重新加载）。0 = 不自动卸载。"),
+    F("res_emb_idle", "Embedding 空闲释放（分钟）",
+      "Unload idle embeddings (min)", page="server", section="res",
+      kind=K_INT, default="30", on=True,
+      modes=frozenset({"server"}), roles=_ROLE_ALL, scope_override="ui",
+      hint="embedding / reranker 连续这段时间没收到请求就自动卸载。"
+           "它们加载很快，可以给个比 LLM 更短的值。0 = 不自动卸载。"),
+
+    # ---- 路由预置（由本程序自动生成，一般不用手动改）
     F("models_preset", "路由预置文件", "Router preset INI (--models-preset)",
-      page="server", flag="--models-preset", kind=K_OPEN, on=False, width=34,
-      modes=frozenset({"server"}), roles=_ROLE_ALL,
-      hint="INI 格式的每模型参数表。段名就是模型名，键是去掉 -- 的长参数名：\n"
-           "  [*]            ← 全局，对所有模型生效\n"
-           "  ctx-size = 32768\n"
-           "  [Qwen3-8B]     ← 单个模型（支持 [名字:Q4_K_M] 这种量化后辍）\n"
-           "  n-gpu-layers = 999\n"
-           "本程序可以按「加载参数」页里保存的预设自动生成这个文件，"
-           "见服务页的「导出路由预置 INI」。"),
-    F("models_autoload", "路由自动加载", "Router autoload", page="server",
-      kind=K_GEAR, default="开启", choices=("开启", "关闭"),
-      argmap={"开启": (), "关闭": ("--no-models-autoload",)},
-      ini={"开启": "true", "关闭": "false"}, long="models-autoload",
-      on=False, modes=frozenset({"server"}), roles=_ROLE_ALL,
-      hint="路由服务是否按需自动加载模型。关掉之后只有显式请求才加载。\n"
-           "（默认就是开启，所以「开启」不产出参数。）"),
+      page="server", section="router", flag="--models-preset", kind=K_OPEN,
+      on=True, width=34, modes=frozenset({"server"}), roles=_ROLE_ALL,
+      hint="INI 格式的每模型参数表：段名就是客户端请求里要写的 model 名，"
+           "键是去掉 -- 的长参数名。\n"
+           "本程序在每次启动 / 参数变更 / 点「重载」时都会按模型库 + 各自的"
+           "加载参数重新生成一份（config/router-preset.ini），所以一般不用管它。"),
+    F("models_max", "引擎驻留兜底上限", "Router max models (--models-max)",
+      page="server", section="router", flag="--models-max", kind=K_INT,
+      default="5", on=True, modes=frozenset({"server"}), roles=_ROLE_ALL,
+      scope_override="ui", hidden=True,
+      long="models-max",
+      hint="引擎自己的同时驻留上限，由「驻留策略」自动算出来，只当兜底"
+           "（引擎的 LRU 不分类别，正常不让它触发）。"),
     # ===================================================================== #
     # 对话（llama-cli）
     #
@@ -977,85 +1009,85 @@ FIELDS: Tuple[F, ...] = (
     F("spec_enable", "启用推测解码", "Speculative decoding", page="spec",
       section="main", flag="", kind=K_BOOL, on=False, modes=_NO_GEN,
       hint="总开关。关闭时这一页所有参数都不会写进命令行。"),
-    F("spec_type", "推测方式", "Spec type (--spec-type)", page="spec",
-      section="main", flag="--spec-type", kind=K_CHOICE_EDIT,
-      default="none", on=False, width=24, modes=_NO_GEN,
-      long="spec-type", multi_value=True,
-      choices=("none", "draft-simple", "draft-eagle3", "draft-mtp",
-               "draft-dflash", "draft-dspark", "dflash", "ngram-simple",
-               "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache",
-               "suffix", "copyspec", "recycle"),
-      hint="**逗号分隔的类型名列表**，可以同时挂多种（如 "
-           "ngram-simple,suffix）。本 build 认这些名字：\n"
-           "· draft-simple —— 普通独立草稿模型（配合 -md）\n"
-           "· draft-eagle3 —— EAGLE3 草稿头\n"
-           "· draft-mtp —— 用主模型自带的 MTP 预测头，**不需要第二个模型**\n"
-           "· draft-dflash / draft-dspark / dflash —— 块扩散草稿，一次并行出一整块\n"
-           "· ngram-simple / ngram-map-k / ngram-map-k4v / ngram-mod / "
-           "ngram-cache —— 纯统计推测，不需要额外模型\n"
-           "· suffix —— 后缀匹配\n"
-           "· copyspec / recycle —— 复制/回收式草稿\n\n"
-           "注意：本 build **不支持** `dflash:n_max=4` 这种内联写法——\n"
-           "所有细项都在下面各自的小节里，是独立的 --spec-* 参数。"),
-    F("spec_default", "用默认推测配置", "Spec default (--spec-default)",
-      page="spec", section="main", flag="--spec-default", kind=K_BOOL,
-      on=False, modes=_NO_GEN, long="spec-default",
-      hint="让引擎自己挑一套默认的推测解码配置（覆盖 --spec-type 的选择）。"),
+    F("spec_type", "推测方式", "Spec method (--spec-type)", page="spec",
+      section="main", flag="--spec-type", kind=K_GEAR, default="MTP",
+      on=False, modes=_NO_GEN, long="spec-type",
+      choices=("MTP", "DFlash", "DSpark"),
+      argmap={"MTP": ("--spec-type", "draft-mtp"),
+              "DFlash": ("--spec-type", "draft-dflash"),
+              "DSpark": ("--spec-type", "draft-dspark")},
+      ini={"MTP": "draft-mtp", "DFlash": "draft-dflash",
+           "DSpark": "draft-dspark"},
+      hint="三选一（本程序只保留这三种）：\n"
+           "· **MTP** —— 用主模型自带的 MTP 预测头，**不需要草稿模型**。\n"
+           "  只有带 MTP 层的主模型能用（模型列表的「MTP」列会标出来）。\n"
+           "· **DFlash** —— 块扩散草稿，一次并行出一整块，**需要草稿模型**"
+           "（下面「草稿模型」里指定）。\n"
+           "· **DSpark** —— DFlash 的稀疏变体，同样需要草稿模型，"
+           "另外多一个「GPU 辅助」开关。\n\n"
+           "切换方式时，下面只显示这种方式用得上的项；不属于它的项"
+           "**不会写进命令行**（值会留在配置里，切回来还在）。"),
     F("spec_dflash_default", "用 DFlash 默认配置",
       "Spec DFlash default (--spec-dflash-default)", page="spec",
       section="main", flag="--spec-dflash-default", kind=K_BOOL, on=False,
       modes=_NO_GEN, long="spec-dflash-default",
-      hint="一键套用 DFlash 的推荐参数（需要先用 -md 指定草稿模型）。"),
+      spec_only=("DFlash", "DSpark"),
+      hint="一键套用 DFlash 的推荐参数（需要先用「草稿模型」指定 -md）。"),
     F("model_draft", "草稿模型", "Draft model (-md)", page="spec",
       section="main", flag="-md", kind=K_OPEN, on=False, width=38,
       modes=_NO_GEN, long="model-draft",
-      hint="提供草稿的模型（draft-simple / draft-dflash / draft-dspark / "
-           "draft-eagle3 需要）。\n"
-           "draft-mtp 与 ngram-* / suffix 不需要。\n"
-           "在模型库里把某个模型「用作推测草稿」就会自动填到这里。"),
-    F("spec_draft_replace", "词汇翻译对",
-      "Spec replace TARGET DRAFT (--spec-draft-replace)", page="spec",
-      section="main", flag="--spec-draft-replace", kind=K_TEXT, on=False,
-      width=30, placeholder="旧词 新词", modes=_NO_GEN, long="spec-draft-replace",
-      hint="草稿模型和主模型的词表不一致时，把 TARGET 翻译成 DRAFT。\n"
-           "填法：两个词用空格隔开，例如 `舊 旧`。"),
+      spec_only=("DFlash", "DSpark"),
+      hint="提供草稿的模型。DFlash / DSpark 需要。\n"
+           "MTP 方式不需要 —— 它用的是主模型自己的 MTP 层。\n"
+           "在模型库里把某个草稿模型「用作推测草稿」就会自动填到这里。"),
     F("spec_mtp_vocab_size", "MTP 词表上限",
       "Spec MTP vocab size (--spec-mtp-vocab-size)", page="spec",
       section="main", flag="--spec-mtp-vocab-size", kind=K_INT, on=False,
       width=10, placeholder="32768", modes=_SERVER, long="spec-mtp-vocab-size",
+      spec_only=("MTP",),
       hint="Qwen-27B 的 MTP 均衡词表大小：0 关闭，32768 启用。"),
-    F("spec_synth_len", "合成接受长度",
-      "Spec synth len (--spec-synth-len)", page="spec", section="main",
-      flag="--spec-synth-len", kind=K_FLOAT, on=False, width=10,
-      modes=_NO_GEN, long="spec-synth-len",
-      hint="目标平均合成接受长度（含目标 token 本身）。**只用于基准测试**。"),
-    F("spec_synth_rates", "合成接受概率",
-      "Spec synth rates (--spec-synth-rates)", page="spec", section="main",
-      flag="--spec-synth-rates", kind=K_TEXT, on=False, width=22,
-      placeholder="0.8,0.6,0.4", modes=_NO_GEN, long="spec-synth-rates",
-      hint="逗号分隔的、按位置排列的无条件合成接受概率。**只用于基准测试**。"),
+    F("dflash_max_slots", "DFlash 并发槽位",
+      "DFlash max slots (--dflash-max-slots)", page="spec", section="main",
+      flag="--dflash-max-slots", kind=K_INT, on=False, width=10,
+      modes=_SERVER, long="dflash-max-slots",
+      spec_only=("DFlash", "DSpark"),
+      hint="带传统 DFlash 状态的并发服务槽位上限（默认 1）。\n"
+           "共享式 draft-dflash / DSpark 会让每个槽位都占一份草稿状态，"
+           "所以开 -np 并发时这里也要跟着抬。"),
+    # ⚠️ 这里**故意没有** `--spec-draft-replace TARGET DRAFT`（词汇翻译对）。
+    #    它是引擎里唯一的两值参数，而路由模式的两条路径都过不去：
+    #      · 命令行：common_params_to_map() → throw "argument with 2 values is
+    #        not yet supported"（实测：failed to initialize router models）
+    #      · 预置 INI：common_preset::to_args() → throw "option '%s' has two
+    #        values, which is not supported yet"
+    #    既然服务只剩路由一种，放出来只会让用户一点就起不来，所以整项删除。
 
-    # ---- 草稿行为
+    # ---- 草稿行为（只有需要外部草稿模型的 DFlash / DSpark 用得上）
     F("spec_draft_n_max", "单次最多草稿数", "Max draft tokens (--spec-draft-n-max)",
       page="spec", section="draft", flag="--spec-draft-n-max", kind=K_INT,
       default="3", on=False, modes=_NO_GEN, long="spec-draft-n-max",
+      spec_only=("DFlash", "DSpark"),
       hint="一次推测最多草拟多少个 token。默认 3。\n"
            "草稿越多越省时间，但被拒时浪费也越多。"),
     F("spec_draft_n_min", "最少草稿数", "Min draft tokens (--spec-draft-n-min)",
       page="spec", section="draft", flag="--spec-draft-n-min", kind=K_INT,
       default="0", on=False, modes=_NO_GEN, long="spec-draft-n-min",
+      spec_only=("DFlash", "DSpark"),
       hint="草稿数低于这个值就不提交验证，直接按普通方式生成。0 = 不由数量决定。"),
     F("spec_draft_p_min", "最低接受概率", "Draft p-min (--spec-draft-p-min)",
       page="spec", section="draft", flag="--spec-draft-p-min", kind=K_FLOAT,
       default="0.0", on=False, modes=_NO_GEN, long="spec-draft-p-min",
+      spec_only=("DFlash", "DSpark"),
       hint="草稿 token 的概率低于该值就丢掉（贪心式过滤）。0 表示不设下限。"),
     F("spec_draft_p_split", "拆分概率", "Draft p-split (--spec-draft-p-split)",
       page="spec", section="draft", flag="--spec-draft-p-split", kind=K_FLOAT,
       default="0.10", on=False, modes=_NO_GEN, long="spec-draft-p-split",
+      spec_only=("DFlash", "DSpark"),
       hint="推测解码的拆分概率。默认 0.10。调大 = 更早切回主模型。"),
     F("spec_draft_temp", "草稿采样温度", "Draft temp (--spec-draft-temp)",
       page="spec", section="draft", flag="--spec-draft-temp", kind=K_FLOAT,
       on=False, modes=_NO_GEN, long="spec-draft-temp",
+      spec_only=("DFlash", "DSpark"),
       hint="草稿模型的采样温度。留空 = 跟随目标模型的设置；0 = 贪心。"),
     F("spec_draft_backend_sampling", "草稿采样放后端",
       "Draft backend sampling (--spec-draft-backend-sampling)", page="spec",
@@ -1065,6 +1097,7 @@ FIELDS: Tuple[F, ...] = (
       argmap={"自动（默认已开启）": (),
               "强制关闭": ("--no-spec-draft-backend-sampling",)},
       long="spec-draft-backend-sampling", on=False, modes=_NO_GEN,
+      spec_only=("DFlash", "DSpark"),
       hint="把草稿模型的采样放到后端设备上执行（默认开启）。\n"
            "草稿在主模型同卡上跑时开着通常更快；排查异常时可以关掉。"),
     F("spec_dspark_gpu_assist", "DSpark GPU 辅助",
@@ -1075,73 +1108,10 @@ FIELDS: Tuple[F, ...] = (
       argmap={"自动（默认已开启）": (),
               "强制关闭": ("--no-spec-dspark-gpu-assist",)},
       long="spec-dspark-gpu-assist", on=False, modes=_SERVER,
+      spec_only=("DSpark",),
       hint="草稿主干留在 CPU、MoE 缓存没关时，把 DSpark 的轻量尾巴放到 GPU 上。"),
 
-    # ---- n-gram 系列（不需要草稿模型，纯统计推测）
-    # 注意：--spec-ngram-size-n / -size-m / -min-hits 这三个旧参数在本 build
-    # 已经被上游删除，改成按算法分别命名 —— 所以下面每个算法各有自己的一份。
-    F("spec_ngram_simple_size_n", "simple 查询长度",
-      "ngram-simple size-n", page="spec", section="ngram",
-      flag="--spec-ngram-simple-size-n", kind=K_INT, default="12", on=False,
-      modes=_NO_GEN, long="spec-ngram-simple-size-n",
-      hint="ngram-simple 用于查找的 n-gram 长度。默认 12。"),
-    F("spec_ngram_simple_size_m", "simple 草稿长度",
-      "ngram-simple size-m", page="spec", section="ngram",
-      flag="--spec-ngram-simple-size-m", kind=K_INT, default="48", on=False,
-      modes=_NO_GEN, long="spec-ngram-simple-size-m",
-      hint="ngram-simple 草拟的 m-gram 长度。默认 48。"),
-    F("spec_ngram_simple_min_hits", "simple 最少命中",
-      "ngram-simple min-hits", page="spec", section="ngram",
-      flag="--spec-ngram-simple-min-hits", kind=K_INT, default="1",
-      on=False, modes=_NO_GEN, long="spec-ngram-simple-min-hits",
-      hint="ngram-simple 至少要命中多少次才拿来做草稿。默认 1。"),
-    F("spec_ngram_map_k_size_n", "map-k 查询长度",
-      "ngram-map-k size-n", page="spec", section="ngram",
-      flag="--spec-ngram-map-k-size-n", kind=K_INT, default="12", on=False,
-      modes=_NO_GEN, long="spec-ngram-map-k-size-n",
-      hint="ngram-map-k 用于查找的 n-gram 长度。默认 12。"),
-    F("spec_ngram_map_k_size_m", "map-k 草稿长度",
-      "ngram-map-k size-m", page="spec", section="ngram",
-      flag="--spec-ngram-map-k-size-m", kind=K_INT, default="48", on=False,
-      modes=_NO_GEN, long="spec-ngram-map-k-size-m",
-      hint="ngram-map-k 草拟的 m-gram 长度。默认 48。"),
-    F("spec_ngram_map_k_min_hits", "map-k 最少命中",
-      "ngram-map-k min-hits", page="spec", section="ngram",
-      flag="--spec-ngram-map-k-min-hits", kind=K_INT, default="1", on=False,
-      modes=_NO_GEN, long="spec-ngram-map-k-min-hits",
-      hint="ngram-map-k 至少要命中多少次才拿来做草稿。默认 1。"),
-    F("spec_ngram_map_k4v_size_n", "map-k4v 查询长度",
-      "ngram-map-k4v size-n", page="spec", section="ngram",
-      flag="--spec-ngram-map-k4v-size-n", kind=K_INT, default="12", on=False,
-      modes=_NO_GEN, long="spec-ngram-map-k4v-size-n",
-      hint="ngram-map-k4v 用于查找的 n-gram 长度。默认 12。"),
-    F("spec_ngram_map_k4v_size_m", "map-k4v 草稿长度",
-      "ngram-map-k4v size-m", page="spec", section="ngram",
-      flag="--spec-ngram-map-k4v-size-m", kind=K_INT, default="48", on=False,
-      modes=_NO_GEN, long="spec-ngram-map-k4v-size-m",
-      hint="ngram-map-k4v 草拟的 m-gram 长度。默认 48。"),
-    F("spec_ngram_map_k4v_min_hits", "map-k4v 最少命中",
-      "ngram-map-k4v min-hits", page="spec", section="ngram",
-      flag="--spec-ngram-map-k4v-min-hits", kind=K_INT, default="1",
-      on=False, modes=_NO_GEN, long="spec-ngram-map-k4v-min-hits",
-      hint="ngram-map-k4v 至少要命中多少次才拿来做草稿。默认 1。"),
-    F("spec_ngram_mod_n_min", "mod 最短 n-gram",
-      "ngram-mod n-min", page="spec", section="ngram",
-      flag="--spec-ngram-mod-n-min", kind=K_INT, default="48", on=False,
-      modes=_NO_GEN, long="spec-ngram-mod-n-min",
-      hint="ngram-mod 里用于推测的最短 n-gram 长度。默认 48。"),
-    F("spec_ngram_mod_n_max", "mod 最长 n-gram",
-      "ngram-mod n-max", page="spec", section="ngram",
-      flag="--spec-ngram-mod-n-max", kind=K_INT, default="64", on=False,
-      modes=_NO_GEN, long="spec-ngram-mod-n-max",
-      hint="ngram-mod 里用于推测的最长 n-gram 长度。默认 64。"),
-    F("spec_ngram_mod_n_match", "mod 查找长度",
-      "ngram-mod n-match", page="spec", section="ngram",
-      flag="--spec-ngram-mod-n-match", kind=K_INT, default="24", on=False,
-      modes=_NO_GEN, long="spec-ngram-mod-n-match",
-      hint="ngram-mod 的查找长度。默认 24。"),
-
-    # ---- 草稿模型自己的资源与放置
+    # ---- 草稿模型自己的资源与放置（只有 DFlash / DSpark 用得上）
     F("ngld", "草稿模型 GPU 层数", "Draft GPU layers (-ngld)", page="spec",
       section="res", flag="-ngld", kind=K_INT, on=False, modes=_NO_GEN,
       long="n-gpu-layers-draft",
@@ -1186,6 +1156,73 @@ FIELDS: Tuple[F, ...] = (
       flag="-ncmoed", kind=K_INT, on=False, modes=_NO_GEN,
       long="n-cpu-moe-draft",
       hint="草稿模型前 N 层的 MoE 权重留在内存。"),
+
+    # ===================================================================== #
+    # LoRA 适配器（独立页面；真正的界面由 ui.LoRAPage 渲染）
+    #
+    # 这一项是 K_META：只为拿到 flag="--lora" 去跟 exe 的 --help 做探测过滤，
+    # 值本身是 JSON（见 builder.parse_lora）。仍然属于 load 作用域，
+    # 所以照旧写进「加载参数」的命令行 / 路由预置。
+    # ===================================================================== #
+    F("lora", "LoRA 适配器", "LoRA adapters (--lora)", page="lora",
+      section="main", flag="--lora", kind=K_META, on=False, modes=_ALL_RUN,
+      long="lora",
+      hint="给当前模型挂若干 LoRA 适配器。比例 1.0 用 --lora，其余用 "
+           "--lora-scaled。\n"
+           "在「加载参数」页里点任意一项都能看到它有没有进命令行。"),
+
+    # ===================================================================== #
+    # Embedding 专属参数（page="emb"，只在弹窗里出现）
+    #
+    # 引擎里跟 embedding / reranker 有关的就这 5 个：
+    #   --embedding / --embeddings   只当嵌入模型用（必须配专用模型）
+    #   --rerank / --reranking       开重排接口 /v1/rerank（默认关）
+    #   --pooling                    none/mean/cls/last/rank，不填跟随模型
+    #   --embd-normalize             -1..N，默认 2
+    #   --embd-gemma-default         用默认 EmbeddingGemma（会联网下权重）
+    # 按用户要求只放这些，不掺任何「对话 / 采样 / 推理链」的无用项。
+    # ===================================================================== #
+    F("emb_enable", "只当嵌入模型用", "Embeddings mode (--embedding)",
+      page="emb", section="main", flag="--embedding", kind=K_BOOL, on=True,
+      modes=_SERVER, long="embedding",
+      hint="限制服务只支持嵌入用途。\n"
+           "⚠️ 只对专门的 embedding 模型开 —— 给普通对话模型开会让它彻底"
+           "不可用于聊天。\n"
+           "本程序会按 GGUF 架构自动判断：embedding 类模型（bge / gte / e5 / "
+           "qwen3-embedding / embeddinggemma …）默认就带上这个参数；"
+           "普通对话模型则一定不带，不用你手动管。"),
+    F("emb_rerank", "开重排接口", "Reranking (--rerank)", page="emb",
+      section="main", flag="--rerank", kind=K_BOOL, on=False, modes=_SERVER,
+      long="reranking",
+      hint="额外暴露 /v1/rerank 重排接口。reranker 类模型（bge-reranker 等）"
+           "需要它。"),
+    F("emb_pooling", "池化方式", "Pooling (--pooling)", page="emb",
+      section="main", flag="--pooling", kind=K_GEAR,
+      default="跟随模型", choices=("跟随模型", "none", "mean", "cls", "last",
+                                   "rank"),
+      argmap={"跟随模型": (), "none": ("--pooling", "none"),
+              "mean": ("--pooling", "mean"), "cls": ("--pooling", "cls"),
+              "last": ("--pooling", "last"), "rank": ("--pooling", "rank")},
+      ini={"none": "none", "mean": "mean", "cls": "cls", "last": "last",
+           "rank": "rank"},
+      long="pooling", on=False, modes=_SERVER,
+      hint="把逐 token 的向量压成一个句向量的方式。\n"
+           "大多数模型自己声明了正确的池化方式，「跟随模型」就行；\n"
+           "显式指定有时能换来更好的检索效果（bge 系通常是 cls，"
+           "e5 / gte 系通常是 mean）。"),
+    F("emb_normalize", "向量归一化", "Embeddings normalize (--embd-normalize)",
+      page="emb", section="main", flag="--embd-normalize", kind=K_INT,
+      on=False, width=10, placeholder="2", modes=_SERVER,
+      long="embd-normalize",
+      hint="输出向量的归一化方式：-1=none，0=max absolute，1=taxicab，"
+           "2=L2（默认），>2=p-范数。\n"
+           "用余弦相似度检索时保持 L2（2）即可。"),
+    F("emb_gemma_default", "用默认 EmbeddingGemma",
+      "Embeddings Gemma default (--embd-gemma-default)", page="emb",
+      section="main", flag="--embd-gemma-default", kind=K_BOOL, on=False,
+      modes=_SERVER, long="embd-gemma-default",
+      hint="直接使用内置的默认 EmbeddingGemma 模型（**会联网下载权重**）。\n"
+           "正常用自己本地的模型时不要勾。"),
 )
 
 # --------------------------------------------------------------------------- #
@@ -1194,23 +1231,44 @@ FIELDS: Tuple[F, ...] = (
 
 FIELD_BY_KEY: Dict[str, F] = {f.key: f for f in FIELDS}
 
-# --spec-type 的合法类型名（buun 的 common_speculative_type_from_name_map）。
-# 它收的是**逗号分隔的列表**，所以一项里可以同时写多个。
-# 名字里的 draft / mtp 是 draft-simple / draft-mtp 的等价别名。
-SPEC_TYPES: Tuple[str, ...] = tuple(FIELD_BY_KEY["spec_type"].choices)
+# 推测方式只保留这三种（--spec-type 的取值分别是 draft-mtp / draft-dflash /
+# draft-dspark）。上游还有 draft-simple / draft-eagle3 / ngram-* / suffix /
+# copyspec / recycle 等十来个类型名，本程序按用户要求不再暴露。
+SPEC_METHODS: Tuple[str, ...] = tuple(FIELD_BY_KEY["spec_type"].choices)
 
-# 需要独立草稿模型（-md）的类型。
-# draft-mtp / mtp 不需要：它用的是主模型自带的 MTP 层
-# （模型没有 MTP 层时引擎只会打一行 warning 然后跳过）。
-# ngram-* / suffix / copyspec / recycle 都是纯统计，也不需要。
-SPEC_NEEDS_DRAFT: FrozenSet[str] = frozenset(
-    ("draft-simple", "draft", "draft-eagle3", "draft-dflash", "draft-dspark",
-     "dflash"))
+# 需要独立草稿模型（-md）的方式。MTP 不需要 —— 它用的是主模型自带的 MTP 层。
+SPEC_NEEDS_DRAFT: FrozenSet[str] = frozenset(("DFlash", "DSpark"))
+
+# 「草稿模型资源与放置」那一组（-ngld / -cd / -ctkd / -ctvd / -td / -tbd /
+# -devd / -otd / -cmoed / -ncmoed）只有需要外部草稿的方式才用得上。
+# 这些字段都是既有字段，逐个去加 spec_only= 太啰嗦，统一在这里挂上。
+for _k in ("ngld", "cd", "ctkd", "ctvd", "td", "tbd", "devd", "otd",
+           "cmoed", "ncmoed"):
+    if _k in FIELD_BY_KEY:
+        FIELD_BY_KEY[_k].spec_only = ("DFlash", "DSpark")
 
 
 def spec_type_names(raw: str) -> Tuple[str, ...]:
     """把 --spec-type 的值拆成一个个小写的类型名。"""
     return tuple(t.strip().lower() for t in str(raw or "").split(",") if t.strip())
+
+
+def spec_method_of(snapshot: Dict[str, Any]) -> str:
+    """当前选的是哪种推测方式（MTP / DFlash / DSpark）；没启用就是空串。"""
+    if not (snapshot or {}).get("spec_enable", {}).get("on"):
+        return ""
+    f = FIELD_BY_KEY.get("spec_type")
+    val = str(((snapshot or {}).get("spec_type") or {}).get("value") or "")
+    if f is None:
+        return val if val in SPEC_METHODS else ""
+    return val if val in SPEC_METHODS else str(f.default_value())
+
+
+def field_visible_for_spec(f: F, method: str) -> bool:
+    """这个字段在当前推测方式下是否该显示 / 是否该写进命令行。"""
+    if not f.spec_only:
+        return True
+    return method in f.spec_only
 
 
 def fields_for(page: str) -> Tuple[F, ...]:
@@ -1241,8 +1299,20 @@ def fields_by_scope(scope: str) -> Tuple[F, ...]:
 def preset_keys(page: str) -> Tuple[str, ...]:
     """页面上会被存进预设的字段（排除纯界面开关）。"""
     return tuple(f.key for f in FIELDS
-                 if f.page == page and f.scope in ("load", "chat"))
+                 if f.page == page and f.scope in ("load", "chat", "emb"))
 
 
 def editable_keys(page: str) -> Tuple[str, ...]:
     return tuple(f.key for f in FIELDS if f.page == page)
+
+
+def spec_engine_value(method: str) -> str:
+    """挡位名 → --spec-type 真正要传的值。"""
+    f = FIELD_BY_KEY.get("spec_type")
+    if f is None:
+        return ""
+    return str((f.argmap or {}).get(method, ("", ""))[-1]) if method else ""
+
+
+def is_emb_page(page: str) -> bool:
+    return page == "emb"

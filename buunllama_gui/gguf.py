@@ -63,6 +63,22 @@ NAME_DRAFTER = (
 # 名字里带这些词说明是「带多 Token 预测头的主模型」，不是草稿模型
 NAME_MTP = ("mtp", "nextn")
 
+# --------------------------------------------------------------------------- #
+# 扫描缓存格式版本
+#
+# ⚠️ 改了 analyse() 返回的字段**必须**把它 +1。
+#    scan.py 的缓存是按「路径 + 版本 + mtime:size」复用的：GGUF 文件本身没变
+#    就永远不重读，于是新加的字段在老缓存里永远缺席 —— 表现出来就是「新功能
+#    在界面里一个都不出现，但直接读 GGUF 又完全正常」。
+#    踩过一次：加了 has_mtp（读 {arch}.nextn_predict_layers）但没动这个 tag，
+#    结果模型库里 6 个明明带 MTP 头的模型一个都没标出来，缓存里 17 条全都
+#    缺 has_mtp 这个键。
+# --------------------------------------------------------------------------- #
+INFO_TAG = "v2"        # v2: has_mtp / nextn_layers / is_drafter
+
+# 缓存里必须齐备的字段（INFO_TAG 忘 +1 时的第二道保险，见 scan._info_complete）
+INFO_REQUIRED = ("arch", "size", "has_mtp", "nextn_layers", "has_vision")
+
 # 文件名前缀 -> 模型发布方
 PUBLISHERS = (
     ("qwen", "Qwen"), ("qwq", "Qwen"),
@@ -409,6 +425,16 @@ def analyse(path: str, want_tensors: bool = True) -> Optional[Dict[str, Any]]:
     vision_keys = any(k.startswith(("clip.", "vision.")) or k in (
         "clip.has_vision_encoder", "clip.has_audio_encoder") for k in kv)
 
+    # MTP（NextN）预测头：引擎就是用这个键决定要不要建 NextN 层的
+    # （src/llama-model.cpp 里 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, ...)）。
+    # ⚠️ 不要拿文件名里有没有 mtp / nextn 去猜 —— 实测一批 27B 名字里没有
+    #    MTP 字样但 nextn_predict_layers 都是 1，反过来也有。
+    nextn = kv.get("%s.nextn_predict_layers" % arch) if arch else None
+    try:
+        n_nextn = int(nextn)
+    except (TypeError, ValueError):
+        n_nextn = 0
+
     try:
         st = os.stat(path)
         size, mtime = st.st_size, st.st_mtime
@@ -457,6 +483,11 @@ def analyse(path: str, want_tensors: bool = True) -> Optional[Dict[str, Any]]:
         "has_think": ("think" in low_tpl) or ("reasoning" in low_tpl),
         "has_tools": ("tool" in low_tpl) or ("function" in low_tpl),
         "has_vision": bool(vision_keys),
+        # 带 MTP 预测头（可以走「推测方式 = MTP」，不需要草稿模型）
+        "has_mtp": n_nextn > 0,
+        "nextn_layers": n_nextn,
+        # 架构就是 dflash 的，是块扩散草稿模型本身（不是主模型）
+        "is_drafter": arch == "dflash",
         "size_text": human_size(size) if size else "",
         "params_text": human_params(params) if params else hint_total,
         "version": version,

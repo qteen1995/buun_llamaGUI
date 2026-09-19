@@ -92,11 +92,13 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 APP_KEYS = tuple(DEFAULTS.keys())
-SCOPES = ("load", "chat")
+# 模型级作用域：load（加载参数 + 推测解码 + LoRA）/ chat（对话参数）/
+# emb（embedding 专属，只有 embedding 类模型用）
+SCOPES = ("load", "chat", "emb")
 
 # 一个模型文件里会写的字段
 _MODEL_FIELDS = ("path", "name", "file", "category_override",
-                 "load", "chat", "load_presets", "chat_presets",
+                 "load", "chat", "emb", "load_presets", "chat_presets",
                  "last_load_preset", "last_chat_preset")
 
 # Windows 文件名里不能出现的字符 + 控制字符
@@ -194,7 +196,22 @@ class Store:
         # 由界面注入：给定模型路径，返回模型库里显示的名字。
         # 有它才能让配置文件名跟着「界面里看到的名字」走。
         self.name_resolver = None
+        self.first_run = False
         self.load()
+        self._write_defaults_on_first_run()
+
+    def _write_defaults_on_first_run(self) -> None:
+        """**首次运行就把默认配置落到数据目录**（一般是 exe 所在目录）。
+
+        不落盘的话，「设置在程序旁边」这件事要等用户动过某个开关才成立 ——
+        用户看不出便携有没有生效，验收时也无从断言（而且 exe 目录里空空的，
+        很像没写权限）。老配置（config.json）存在时不动它，交给上面的迁移流程。
+        """
+        if os.path.isfile(self.app_path) or os.path.isfile(self.legacy_path):
+            return
+        self.first_run = True
+        self._written_app = None        # 强制 save() 认为「还没写过」
+        self.save()
 
     # ------------------------------------------------------------- 路径
     def model_file_path(self, key: str) -> str:
@@ -430,14 +447,14 @@ class Store:
                 "name": str(name or ""),
                 "file": "",
                 "category_override": "",
-                "load": {}, "chat": {},
+                "load": {}, "chat": {}, "emb": {},
                 "load_presets": {}, "chat_presets": {},
                 "last_load_preset": "", "last_chat_preset": "",
             }
             self._assign_file(k)
         entry = models[k]
-        for key, dv in (("load", {}), ("chat", {}), ("load_presets", {}),
-                        ("chat_presets", {})):
+        for key, dv in (("load", {}), ("chat", {}), ("emb", {}),
+                        ("load_presets", {}), ("chat_presets", {})):
             entry.setdefault(key, copy.deepcopy(dv))
         if name and not entry.get("name"):
             # 之前不知道显示名，现在知道了 → 记下来（文件名下次保存时跟上）
@@ -464,8 +481,8 @@ class Store:
         """有自定义参数（加载或对话）或命名预设的模型路径。"""
         out = []
         for entry in (self.data.get("models") or {}).values():
-            if entry.get("load") or entry.get("chat") or \
-                    entry.get("load_presets") or entry.get("chat_presets"):
+            if entry.get("load") or entry.get("chat") or entry.get("emb") \
+                    or entry.get("load_presets") or entry.get("chat_presets"):
                 p = entry.get("path")
                 if p:
                     out.append(p)
@@ -546,18 +563,10 @@ class Store:
         return self.data.setdefault("roles", {}).setdefault(
             name, {"model": "", "server": {}})
 
-    def role_model(self, name: str) -> str:
-        key = str(self.role(name).get("model") or "")
-        if not key:
-            return ""
-        entry = (self.data.get("models") or {}).get(key)
-        if entry and entry.get("path"):
-            return str(entry["path"])
-        return key      # 条目还没建过就直接用 key（规范化后的绝对路径）
-
-    def set_role_model(self, name: str, path: str) -> None:
-        self.ensure_model(path)
-        self.role(name)["model"] = model_key(path)
+    # 「角色默认模型」（role_model / set_role_model）已删除 —— 用户要求去掉
+    # 「设置默认模型」功能。现在只有一个「目标模型」= 模型库里选中的那行，
+    # 重启后从 recent_models（最近使用）恢复。旧配置里的 roles.<名>.model
+    # 字段会被忽略，不影响加载。
 
     def role_state(self, name: str) -> Dict[str, Any]:
         return self.role(name).setdefault("server", {})

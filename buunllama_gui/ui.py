@@ -31,6 +31,7 @@ from . import gguf as GG
 from . import manager as MG
 from . import process as P
 from . import probe as PR
+from . import router as ROU
 from . import runtime as RT
 from . import scan as SC
 from . import schema as S
@@ -44,10 +45,6 @@ from .widgets import (LogView, ScrollableFrame, Segmented, Sidebar, Tooltip,
                       classify)
 
 APP_TITLE = "buun-llama 启动器"
-RESULT_PATTERNS = (
-    re.compile(r"([\d.]+)\s*tokens?\s+per\s+second", re.I),
-    re.compile(r"([\d.]+)\s*t/s\b", re.I),
-)
 
 # 进程非 0 退出时的定向诊断：(正则, 标题, 建议)
 # 扫的是这个进程最后几百行输出 —— 比让用户自己往上翻靠谱
@@ -76,22 +73,25 @@ _EXIT_HINTS: Tuple[Tuple["re.Pattern[str]", str, str], ...] = (
     (re.compile(r"CUDA error|no kernel image|driver", re.I),
      "CUDA / 驱动问题",
      "检查显卡驱动与 CUDA 运行时是否匹配这份编译产物。"),
+    (re.compile(r"failed.*speculative.*model.*context"
+                r"|failed to create llama_context from model"
+                r"|speculative.*failed to measure", re.I),
+     "推测解码草稿模型无法加载",
+     "草稿模型（-md）创建 llama_context 失败。常见原因："
+     "①草稿模型的架构与主模型不兼容（需要同一架构族）；"
+     "②草稿模型的上下文长度或头维度与主模型不匹配；"
+     "③显存不够同时装两个模型，先关掉推测解码单独加载主模型试试。"),
 )
 
-# 侧边栏图标（页面 id -> 字符）。分组与标题直接取 schema，
-# 免得加一个运行模式就要在两个地方各改一遍。
-PAGE_ICONS: Dict[str, str] = {
-    "lib": "\u25a3",       # ▣
-    "server": "\u25c9",    # ◉
-    "cli": "\u25b7",       # ▷
-    "gen": "\u25b6",       # ▶
-    "load": "\u2699",      # ⚙
-    "chat": "\u25d7",      # ◗
-    "spec": "\u2726",      # ✦
-}
+# 侧边栏图标：**故意留空**。
+# 用户要求把「模型库 / 服务 / 对话 / 生成 / 加载参数 / 对话参数 / 推测解码」
+# 这些标题前面的符号全去掉 —— 导航就是一列纯文字，干净。
+# widgets.Sidebar 里已经有 `if icon:` 分支，空串就不渲染前缀。
+# 要恢复图标的话，在这里填 {页面 id: 字符} 就行。
+PAGE_ICONS: Dict[str, str] = {}
 
 SIDEBAR_GROUPS: Tuple[Tuple[str, Tuple[Tuple[str, str, str], ...]], ...] = tuple(
-    (zh, tuple((pid, S.PAGE_ZH.get(pid, pid), PAGE_ICONS.get(pid, "\u25cf"))
+    (zh, tuple((pid, S.PAGE_ZH.get(pid, pid), PAGE_ICONS.get(pid, ""))
                for pid in ids))
     for zh, _en, ids in S.NAV_GROUPS)
 
@@ -440,6 +440,11 @@ class ParamPage(ttk.Frame):
         self._en = bool(app.store.pref("show_english"))
         sections = S.sections_for(page)
         if sections:
+            # 声明了小节的页面：没有 section 的字段先作为「无标题组」排在最前
+            # （服务页就是这样：服务/端口那一批 + 驻留策略 + 路由预置）
+            loose = list(S.fields_in(page, ""))
+            if loose:
+                groups.append((None, loose))
             for sid, title in sections:
                 fields = list(S.fields_in(page, sid))
                 if fields:
@@ -458,8 +463,8 @@ class ParamPage(ttk.Frame):
             ttk.Label(head, text="正在配置角色", style="Alt.TLabel").pack(
                 side="left")
             ttk.Label(head,
-                      text="单模型网关 = 本程序负责换模型；"
-                           "多模型路由 = llama-server 自己驻留多个模型",
+                      text="服务跑的是多模型路由：一个进程下挂多个模型，"
+                           "下面的「已加载模型」列表可以分别卸载",
                       style="Alt.TLabel").pack(side="left")
             ttk.Button(head, text="导出路由预置 INI", style="Mini.TButton",
                        command=app.export_router_preset).pack(side="right")
@@ -494,13 +499,9 @@ class ParamPage(ttk.Frame):
                 ttk.Separator(cap, orient="horizontal").pack(
                     side="left", fill="x", expand=True, padx=(8, 0))
                 rowno += 1
-            if title and title in S.CUSTOM_SECTIONS.get(page, ()):
-                # 这一节由专门的组件渲染（如 LoRA 适配器列表）
-                panel = app.make_custom_section(page, title, inner, rowno)
-                if panel is not None:
-                    rowno += 1
-                continue
             for f in fields:
+                if f.hidden:
+                    continue           # 纯计算项（如 --models-max），不占界面
                 row = FieldRow(app, inner, f, rowno, app.initial_state(f))
                 app.rows[f.key] = row
                 rowno += 1
@@ -521,8 +522,11 @@ class LoRAPanel(ttk.Frame):
     """LoRA 适配器列表：手动添加路径、设比例、排序、删除。
 
     数据存在「这个模型的加载参数」里的 ``lora`` 项：value 是一个 JSON 字符串，
-    所以它跟别的加载参数一样跟着模型走、也走同一套命令行拼装
-    （``--lora 路径`` / ``--lora-scaled 路径 比例``）。
+    所以它跟别的加载参数一样跟着模型走、也走同一套命令行拼装。
+    ⚠️ buun 的 LoRA 参数是**单值逗号分隔**形式（跟上游 llama.cpp 不一样）：
+        --lora a.gguf,b.gguf
+        --lora-scaled p.gguf:0.8,q.gguf:0.5
+    这也是它能写进路由预置 INI 的原因（两值写法会被引擎的 preset 层拒绝）。
     """
 
     def __init__(self, app: "App", parent: tk.Widget) -> None:
@@ -534,8 +538,8 @@ class LoRAPanel(ttk.Frame):
             self,
             text=("给当前模型挂 LoRA 适配器。路径手动添加（也可以选文件）；"
                   "一个模型可以挂多个，按列表顺序依次应用。\n"
-                  "比例 = 1.0 用 --lora，其它值用 --lora-scaled 路径 比例"
-                  "（负数 = 反向效果）。列表按模型保存，改完要重启模型才生效。"),
+                  "比例 = 1.0 用 --lora，其它值用 --lora-scaled 路径:比例"
+                  "（负数 = 反向效果）。列表按模型保存，改完要重新加载模型才生效。"),
             style="MutedCard.TLabel", justify="left").grid(
                 row=0, column=0, sticky="w", pady=(0, 4))
 
@@ -758,6 +762,138 @@ class LoRAPanel(ttk.Frame):
 # 模型库页
 # --------------------------------------------------------------------------- #
 
+class LoRAPage(ttk.Frame):
+    """LoRA 适配器（独立导航页）。
+
+    以前它是「加载参数」页里的一个自定义小节，现在按用户要求挪到左侧导航里，
+    跟 模型库 / 服务 / 对话 / 生成 / 加载参数 / 对话参数 / 推测解码 并排。
+    数据仍在 load 作用域（跟模型走），`--lora` / `--lora-scaled` 照旧写进
+    这个模型的路由预置段 —— 换句话说，搬的只是「编辑入口」。
+    """
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app.content, style="TFrame")
+        self.app = app
+        body = ScrollableFrame(self)
+        body.pack(fill="both", expand=True)
+        inner = body.body
+        inner.columnconfigure(0, weight=1)
+
+        head = ttk.Frame(inner, style="Alt.TFrame", padding=(10, 6))
+        head.grid(row=0, column=0, sticky="ew", pady=(2, 8))
+        ttk.Label(head, text="正在编辑模型", style="Alt.TLabel").pack(side="left")
+        lbl = ttk.Label(head, text="", style="Alt.TLabel",
+                        font=T.FONT_UI_BOLD)
+        lbl.pack(side="left", padx=(8, 10))
+        ttk.Label(head, text="LoRA 列表按模型分别保存，切到别的模型会自动带出它自己的",
+                  style="Alt.TLabel").pack(side="left")
+        app.model_labels.append(lbl)
+
+        self.panel = LoRAPanel(app, inner)
+        self.panel.grid(row=1, column=0, sticky="ew")
+        ttk.Frame(inner, style="Card.TFrame", height=16).grid(
+            row=2, column=0, sticky="ew")
+
+    def reload(self) -> None:
+        self.panel.reload()
+
+
+class EmbDialog(tk.Toplevel):
+    """embedding / reranker 的专属设置窗口（需求 5）。
+
+    embedding 模型没有对话模板、采样、推理强度这些东西 —— 把「加载参数」和
+    「对话参数」两大页塞给它，90% 的项都是无意义的。所以模型库选中 embedding
+    类模型时，那个「编辑 xxx 参数」按钮会换成一个「embedding 设置」，
+    弹出来的就是这个小窗口，里面只有引擎真正认的 5 个 embedding 参数：
+
+        --embedding / --rerank / --pooling / --embd-normalize
+        --embd-gemma-default
+
+    （KV 档位之类由 builder.emb_guard 按模型几何自动处理，不用用户管。）
+    取值存在这个模型的 ``emb`` 作用域里，跟别的模型参数一样走 config\models\<名>.json。
+    """
+
+    def __init__(self, app: "App", path: str) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.path = path
+        self.rows: Dict[str, FieldRow] = {}
+        self.configure(background=C["panel"])
+        self.title("Embedding 设置 · %s" % os.path.basename(path)[:44])
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        body = ttk.Frame(self, style="Card.TFrame", padding=(16, 12))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(2, weight=1, minsize=210)
+        body.columnconfigure(3, minsize=96)
+        ttk.Label(body, text="Embedding 专属设置", style="Card.TLabel",
+                  font=T.FONT_UI_BOLD).grid(row=0, column=0, columnspan=4,
+                                            sticky="w")
+        ttk.Label(
+            body,
+            text=("只放引擎真正认的 embedding / reranker 参数，不加任何"
+                  "对话、采样、推理链相关的项。\n"
+                  "KV 档位会被自动钉成合适的值（bert 系必须 f16），不用管。"),
+            style="MutedCard.TLabel", justify="left").grid(
+                row=1, column=0, columnspan=4, sticky="w", pady=(2, 10))
+
+        prev = app.selected_model
+        app.selected_model = path
+        try:
+            for i, f in enumerate(S.fields_for("emb")):
+                if f.hidden:
+                    continue
+                row = FieldRow(app, body, f, 2 + i, app.initial_state(f))
+                app.rows[f.key] = row
+                self.rows[f.key] = row
+        finally:
+            app.selected_model = prev
+
+        bar = ttk.Frame(body, style="Card.TFrame")
+        bar.grid(row=2 + len(self.rows) + 1, column=0, columnspan=4,
+                 sticky="ew", pady=(14, 0))
+        ttk.Button(bar, text="保存", style="Accent.TButton",
+                   command=self.save).pack(side="right")
+        ttk.Button(bar, text="取消", style="TButton",
+                   command=self.close).pack(side="right", padx=(0, 6))
+        self.bind("<Escape>", lambda _e: self.close())
+        self.update_idletasks()
+        # 摆在主窗口中间
+        try:
+            x = app.root.winfo_rootx() + (app.root.winfo_width()
+                                         - self.winfo_width()) // 2
+            y = app.root.winfo_rooty() + 120
+            self.geometry("+%d+%d" % (max(0, x), max(0, y)))
+        except Exception:  # noqa: BLE001
+            pass
+        self.grab_set()
+
+    def save(self) -> None:
+        prev = self.app.selected_model
+        self.app.selected_model = self.path
+        try:
+            self.app.collect("emb")
+        finally:
+            self.app.selected_model = prev
+        self.app.store.save()
+        self.app.log_append("已保存 %s 的 embedding 设置"
+                            % os.path.basename(self.path), "ok")
+        if self.app.lib is not None:
+            self.app.lib.refresh_table()
+        self.close()
+
+    def close(self) -> None:
+        for k in list(self.rows):
+            self.app.rows.pop(k, None)
+        try:
+            self.grab_release()
+        except Exception:  # noqa: BLE001
+            pass
+        self.destroy()
+
+
 class LibraryPage(ttk.Frame):
     def __init__(self, app: "App") -> None:
         super().__init__(app.content, style="TFrame")
@@ -805,9 +941,7 @@ class LibraryPage(ttk.Frame):
         self.cat_seg.grid(row=0, column=1, padx=(8, 14))
         self.cat_seg.set_value(str(app.store.pref("category", "全部")))
 
-        caps = (("全部能力", ""), ("%s 推理" % SC.ICO_THINK, "think"),
-                ("%s 多模态" % SC.ICO_VISION, "vision"),
-                ("%s 工具" % SC.ICO_TOOLS, "tools"))
+        caps = (("全部能力", ""), ("能读图", "vision"), ("MTP", "mtp"))
         self._cap_map = {c[0]: c[1] for c in caps}
         self.cap_seg = Segmented(flt, tuple(c[0] for c in caps),
                                  on_change=self._on_cap)
@@ -830,7 +964,7 @@ class LibraryPage(ttk.Frame):
         qe.bind("<KeyRelease>", lambda _e: self.refresh_table())
         Tooltip(qe, "按模型名 / 文件名 / 架构 / 发布者 / 量化规格模糊匹配。")
         ttk.Label(
-            flt, text="图标：" + SC.LEGEND
+            flt, text="能力列：" + SC.LEGEND
             + "      模型名与发布者取自目录结构（…\\发布者\\模型名\\xxx.gguf）",
             style="MutedCard.TLabel").grid(
             row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
@@ -870,18 +1004,42 @@ class LibraryPage(ttk.Frame):
         self.detail_lbl.grid(row=0, column=0, sticky="w")
         btns = ttk.Frame(det, style="Alt.TFrame")
         btns.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(btns, text="设为当前模型并启动", style="Accent.TButton",
-                   command=lambda: self.assign("llm", True)).pack(side="left")
-        ttk.Button(btns, text="编辑加载参数", style="Mini.TButton",
-                   command=self.edit_load).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="编辑对话参数", style="Mini.TButton",
-                   command=self.edit_chat).pack(side="left", padx=(4, 0))
+        # 用户要求：删掉「设为当前模型并启动」，保留「卸载」。
+        # 现在「选中哪一行」就等于「目标模型是谁」，所以只需要一个「加载」。
+        self.btn_load = ttk.Button(btns, text="加载", style="Accent.TButton",
+                                   command=self.load_selected)
+        self.btn_load.pack(side="left")
+        Tooltip(self.btn_load,
+                "把这个模型装进路由（同时可以装多个，各自独立）。\n"
+                "路由没在跑的话会顺便把它启动起来。\n"
+                "装进来的模型会出现在顶栏「已加载模型」里，可以单独卸载。")
+        # 「编辑加载参数 / 编辑对话参数」和「embedding 设置」互斥地放在这里的
+        # 小容器里 —— 选中 embedding 类模型时换成后者（见 _paint_detail）
+        self.edit_holder = ttk.Frame(btns, style="Alt.TFrame")
+        self.edit_holder.pack(side="left", padx=(8, 0))
+        self.btn_edit_load = ttk.Button(self.edit_holder, text="编辑加载参数",
+                                       style="Mini.TButton",
+                                       command=self.edit_load)
+        self.btn_edit_load.pack(side="left")
+        self.btn_edit_chat = ttk.Button(self.edit_holder, text="编辑对话参数",
+                                       style="Mini.TButton",
+                                       command=self.edit_chat)
+        self.btn_edit_chat.pack(side="left", padx=(4, 0))
+        self.btn_emb = ttk.Button(self.edit_holder, text="embedding 设置",
+                                  style="Mini.TButton",
+                                  command=self.edit_emb)
+        Tooltip(self.btn_emb,
+                "embedding / reranker 模型没有对话模板、采样、推理链，\n"
+                "所以这里只弹一个只含 embedding 专属参数的小窗口。")
         ttk.Button(btns, text="用作推测草稿", style="Mini.TButton",
                    command=self.use_as_draft).pack(side="left", padx=(8, 0))
         self.btn_unload = ttk.Button(btns, text="卸载", style="Danger.TButton",
                                      command=self.unload_selected)
         self.btn_unload.pack(side="left", padx=(8, 0))
         self.btn_unload.state(["disabled"])
+        Tooltip(self.btn_unload,
+                "把这个模型从路由里卸掉（子进程收掉、显存还回去）。\n"
+                "其他已加载的模型不受影响。")
         ttk.Button(btns, text="打开目录", style="Mini.TButton",
                    command=self.open_dir).pack(side="left", padx=(8, 0))
 
@@ -998,10 +1156,9 @@ class LibraryPage(ttk.Frame):
         self._paint_detail(row)
 
     def _paint_detail(self, row: Dict[str, Any]) -> None:
-        caps = "%s 推理链    %s 多模态    %s 工具调用" % (
-            SC.ICO_THINK if row.get("has_think") else "–",
-            SC.ICO_VISION if row.get("has_vision") else "–",
-            SC.ICO_TOOLS if row.get("has_tools") else "–")
+        caps = "能读图 %s    带 MTP 预测头 %s" % (
+            "是" if row.get("has_vision") else "否",
+            "是" if row.get("has_mtp") else "否")
         bits = [
             row["name"],
             "%s · %s · %s" % (row.get("arch") or "架构未知",
@@ -1023,50 +1180,104 @@ class LibraryPage(ttk.Frame):
             "多模态投影：%s" % (os.path.basename(row["mmproj"])
                                 if row.get("mmproj") else "无"),
         ]
-        if row.get("mtp_hint"):
-            bits.append("名称带 MTP/NextN：这是带多 Token 预测头的主模型，"
-                        "推测解码里选 mtp 方式即可，不需要另配草稿模型")
+        if row.get("has_mtp"):
+            bits.append("带 MTP 预测头（GGUF 里 nextn_predict_layers=%d）："
+                        "推测解码里选 MTP 方式即可，不需要另配草稿模型"
+                        % int(row.get("nextn_layers") or 0))
+        elif row.get("mtp_name_hint"):
+            bits.append("⚠ 名字里带 MTP/NextN，但 GGUF 里**没有** MTP 层"
+                        "（nextn_predict_layers 为空）。选 MTP 方式不会生效，"
+                        "只能配草稿模型走 DFlash / DSpark。")
         exe_now = B.resolve_exe(self.app.engine_var.get().strip(), "server")
         bad = self.app.known_bad_arch(exe_now, row["path"])
         if bad:
             bits.append("⚠ 当前的 llama-server 上一次加载「%s」架构就失败了"
                         "（unknown model architecture）。换模型，"
                         "或把 buun-llama-cpp 更新到支持它的版本。" % bad)
-        loaded_by = []
-        for role in S.ROLE_ORDER:
-            st = self.app.manager.get(role)
-            if st.running and st.model and model_key(st.model) == \
-                    model_key(row["path"]):
-                loaded_by.append(S.ROLES[role]["zh"])
-        if loaded_by:
-            bits.append("当前已作为 %s 运行中" % " / ".join(loaded_by))
+        # 是否已驻留：问路由（多模型了，不再是「某个角色正在跑」）
+        name = self.app.router_name_for(row["path"])
+        resident = bool(name) and name in (self.app.router.loaded_names() or [])
+        if resident:
+            state = "已驻留"
+            for m in (self.app.router.snapshot().get("models") or []):
+                if m.get("id") == name:
+                    state = ROU.STATUS_ZH.get(str(m.get("status")), state)
+                    break
+            bits.append("已加载（%s）—— 顶栏「已加载模型」里可以单独卸载"
+                        % state)
+        # embedding 类模型：两个「编辑 xxx 参数」换成单个「embedding 设置」
+        emb = row.get("category") == "Embedding"
+        if emb:
+            self.btn_edit_load.pack_forget()
+            self.btn_edit_chat.pack_forget()
+            if not self.btn_emb.winfo_manager():
+                self.btn_emb.pack(side="left")
+        else:
+            self.btn_emb.pack_forget()
+            if not self.btn_edit_load.winfo_manager():
+                self.btn_edit_load.pack(side="left")
+            if not self.btn_edit_chat.winfo_manager():
+                self.btn_edit_chat.pack(side="left", padx=(4, 0))
         self.detail_lbl.configure(text="\n".join(bits))
-        self.btn_unload.state(["!disabled"] if loaded_by else ["disabled"])
+        # Drafters 不能单独加载，禁用加载按钮
+        is_drafter = row.get("category") == "Drafters"
+        self.btn_load.state(["disabled"] if is_drafter else ["!disabled"])
+        self.btn_unload.state(["!disabled"] if resident else ["disabled"])
 
     def selected_row(self) -> Optional[Dict[str, Any]]:
         sel = self.tree.selection()
         return self.app.lib_index.get(sel[0]) if sel else None
 
     # ------------------------------------------------------------ 动作
-    def assign(self, role: str, start: bool) -> None:
+    def load_selected(self) -> None:
+        """「加载」：把选中的模型装进路由。"""
         row = self.selected_row()
         if not row:
             messagebox.showinfo("先选一个模型", "请在表格里选中一行。",
                                 parent=self.app.root)
             return
-        self.app.assign_role(role, row["path"], start=start)
+        # Drafters 不能单独加载，只能通过推测解码参数关联
+        if row.get("category") == "Drafters":
+            messagebox.showinfo(
+                "不能单独加载草稿模型",
+                "草稿模型（Drafter）不能单独加载到路由里。\n"
+                "请在「推测解码」参数里配好草稿模型，它会跟随主 LLM 一起加载。",
+                parent=self.app.root)
+            return
+        self.app.selected_model = row["path"]
+        # 记一笔「最近使用」：重启后用它恢复上次的模型（原来靠「默认模型」）
+        self.app.store.push_unique("recent_models", row["path"])
+        self.app.store.save()
+        self.app.router_load(row["path"])
+
+    def edit_emb(self) -> None:
+        """embedding 专属设置的弹窗入口。"""
+        row = self.selected_row()
+        if not row:
+            messagebox.showinfo("先选一个模型", "请在表格里选中一行。",
+                                parent=self.app.root)
+            return
+        self.app.show_emb_dialog(row["path"])
 
     def edit_load(self) -> None:
         row = self.selected_row()
-        if row:
-            self.app.selected_model = row["path"]
-            self.app.show("load")
+        if not row:
+            return
+        self.app.selected_model = row["path"]
+        if row.get("category") == "Embedding":
+            self.app.show_emb_dialog(row["path"])
+            return
+        self.app.show("load")
 
     def edit_chat(self) -> None:
         row = self.selected_row()
-        if row:
-            self.app.selected_model = row["path"]
-            self.app.show("chat")
+        if not row:
+            return
+        self.app.selected_model = row["path"]
+        if row.get("category") == "Embedding":
+            self.app.show_emb_dialog(row["path"])
+            return
+        self.app.show("chat")
 
     def use_as_draft(self) -> None:
         row = self.selected_row()
@@ -1076,7 +1287,7 @@ class LibraryPage(ttk.Frame):
     def unload_selected(self) -> None:
         row = self.selected_row()
         if row:
-            self.app.unload_model(row["path"])
+            self.app.router_unload_path(row["path"])
 
     def open_dir(self) -> None:
         row = self.selected_row()
@@ -1124,13 +1335,24 @@ class App:
         # 运行时状态：轮询后端 /props + /slots，并接收网关转发时抓到的 timings
         self.runtime = RT.RuntimeStatus(log_fn=self.log_append_ts)
         self.rt_lbl: Optional[ttk.Label] = None
-        self.rt_prog: Optional[ttk.Progressbar] = None
-        self.rt_pct: Optional[ttk.Label] = None
+        self.rt_pct: Optional[ttk.Label] = None   # 已用上下文：纯文字
+        # 多模型路由的后端：模型清单轮询 + 按类限流 + 空闲卸载。
+        # ⚠️ 空闲卸载现在由它负责（LLM / Embedding 两套独立计时，见「驻留策略」），
+        #    所以下面 UnifiedBackend 的 idle 那套关掉，免得两边抢着卸。
+        self.router_policy = ROU.ResidencyPolicy()
+        self.router = ROU.RouterMonitor(
+            kind_of=self.router_kind_of,
+            policy=self.router_policy,
+            log=self.log_append_ts)
+        self.runtime._router = self.router   # 让运行时能查子模型真实数据
+        # 段名（= 客户端请求里写的 model 名）→ 模型路径 / 类别
+        self.router_kind_map: Dict[str, str] = {}
+        self.router_path_map: Dict[str, str] = {}
+        # 本次会话加载过的模型（段名）——「重载」会把它们重新加载一遍
+        self.router_history: List[str] = []
         self.unified = UnifiedBackend(
             self.manager, self.manager.bus,
             status_fn=lambda: self.manager.status().get("unified", {}),
-            idle_minutes_fn=self.idle_unload_minutes,
-            # 只有「统一端口单模型」一种运行方式，永远启用
             enabled_fn=lambda: True,
             log_fn=self.log_append_ts)
         self.api = ControlAPI(
@@ -1139,10 +1361,11 @@ class App:
             models_provider=self.library_brief,
             upstream_key=self.upstream_api_key,
             unified=self.unified,
-            auto_switch=self.auto_switch_on,
             default_model=self.default_model_for,
             row_resolver=self.row_for_path,
-            runtime=self.runtime)
+            runtime=self.runtime,
+            # 路由监控：网关转发时把「这个模型刚被用过」记进去，空闲卸载靠它
+            router=self.router)
         self._gateway_key = ("", 0)
         self._gw_after: Optional[str] = None
         self._gw_error = ""
@@ -1154,7 +1377,6 @@ class App:
         self._pending_scan: Tuple[List[Dict[str, Any]], str] = ([], "")
         self._tick = 0
         self._closing = False
-        self.last_ts = ""
         self.tray = None                       # TrayIcon，建好后才用
         self._minimized = False               # 当前是否收在托盘
 
@@ -1166,7 +1388,6 @@ class App:
         self._setup_tray()
         self._restore_session()
         self._bind_keys()
-        self.unified.start_idle_watch()
         self.root.after(120, self._pump)
         if self._start_minimized:
             self.minimize_to_tray()
@@ -1413,43 +1634,49 @@ class App:
                    "…\\build\\bin\\Release），也可以直接选中某个 .exe。\n"
                    "「探测参数支持」会跑一次 --help，把当前 build 不认识的参数标出来。")
 
+        # ---- 目标模型 + 已加载模型（多模型路由）
+        #
+        # 用户要求：删掉「选模型」「设为当前」，保留「卸载」，并且要能显示多个模型。
+        # 所以这里不再是「一个角色一张卡」，而是：
+        #   · 目标模型  —— 模型库里选中谁，它就是谁（不用再点按钮「设为当前」）
+        #   · 已加载    —— 路由当前驻留的全部模型，每个都能单独卸载
         slots = ttk.Frame(bar, style="Bar.TFrame")
         slots.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        slots.columnconfigure(0, weight=1)
         slots.columnconfigure(1, weight=1)
+
+        card = ttk.Frame(slots, style="Alt.TFrame", padding=(10, 6))
+        card.grid(row=0, column=0, sticky="w")
+        ttk.Label(card, text="目标模型", style="Alt.TLabel",
+                  font=T.FONT_UI_BOLD).grid(row=0, column=0, sticky="w")
+        self.target_dot = ttk.Label(card, text="\u25cb", style="Alt.TLabel")
+        self.target_dot.grid(row=0, column=1, sticky="w", padx=(8, 3))
+        self.target_name = ttk.Label(card, text="未指定", style="Alt.TLabel")
+        self.target_name.grid(row=0, column=2, sticky="w")
+        self.target_state = ttk.Label(card, text="", style="MutedAlt.TLabel")
+        self.target_state.grid(row=1, column=0, columnspan=3, sticky="w",
+                               pady=(2, 0))
+        Tooltip(card, "点「加载」装的就是这个模型。\n"
+                      "在「模型库」里选中哪一行，目标就是哪个 —— "
+                      "不用再点「设为当前」。\n"
+                      "要同时装多个，就依次选中 → 点「加载」。")
+
+        hold = ttk.Frame(slots, style="Alt.TFrame", padding=(10, 6))
+        hold.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        hold.columnconfigure(0, weight=1)
+        head = ttk.Frame(hold, style="Alt.TFrame")
+        head.grid(row=0, column=0, sticky="w")
+        ttk.Label(head, text="已加载模型", style="Alt.TLabel",
+                  font=T.FONT_UI_BOLD).pack(side="left")
+        self.loaded_count = ttk.Label(head, text="", style="MutedAlt.TLabel")
+        self.loaded_count.pack(side="left", padx=(8, 0))
+        Tooltip(head, "路由进程当前驻留的模型（每秒自动刷新）。\n"
+                      "每个都能单独卸载 —— 卸载会把它的子进程整个收掉、"
+                      "显存还回去，其他模型不受影响。\n"
+                      "同时驻留几个、空闲多久自动卸，见「服务」页的「驻留策略」。")
+        self.loaded_box = ttk.Frame(hold, style="Alt.TFrame")
+        self.loaded_box.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.loaded_sig: Optional[Tuple] = None
         self.role_widgets: Dict[str, Dict[str, Any]] = {}
-        for i, role in enumerate(S.ROLE_ORDER):
-            card = ttk.Frame(slots, style="Alt.TFrame", padding=(10, 6))
-            card.grid(row=0, column=i, sticky="ew",
-                      padx=(0, 8) if i == 0 else 0)
-            card.columnconfigure(2, weight=1)
-            title = ttk.Label(card, text=S.ROLES[role]["zh"], style="Alt.TLabel",
-                              font=T.FONT_UI_BOLD)
-            title.grid(row=0, column=0, sticky="w")
-            dot = ttk.Label(card, text="\u25cb", style="Alt.TLabel")
-            dot.grid(row=0, column=1, sticky="w", padx=(8, 3))
-            state = ttk.Label(card, text="未启动", style="Alt.TLabel")
-            state.grid(row=0, column=2, sticky="w")
-            name = ttk.Label(card, text="", style="Alt.TLabel")
-            name.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
-            pick = ttk.Menubutton(card, text="选模型", style="Mini.TMenubutton")
-            pmenu = tk.Menu(pick, tearoff=0)
-            pick.configure(menu=pmenu)
-            pick.grid(row=0, column=3, rowspan=2, padx=(6, 0))
-            act = ttk.Button(card, text="启动", style="Mini.TButton",
-                             command=lambda r=role: self.toggle_role(r))
-            act.grid(row=0, column=4, rowspan=2, padx=(6, 0))
-            unload = ttk.Button(card, text="卸载", style="Mini.TButton",
-                                command=lambda r=role: self.unload_role(r))
-            unload.grid(row=0, column=5, rowspan=2, padx=(4, 0))
-            self.role_widgets[role] = {
-                "card": card, "title": title, "dot": dot, "state": state,
-                "name": name, "pick": pick, "menu": pmenu, "act": act,
-                "unload": unload}
-            pmenu.configure(postcommand=lambda r=role: self._fill_role_menu(r))
-            Tooltip(card,
-                    "当前模型：%s\n点「选模型」换一个，「启动 / 停止」管的是\n"
-                    "统一后端这唯一一个 llama-server 进程。" % S.ROLES[role]["tip"])
 
     # ------------------------------------------------------------ 主体
     def _build_body(self) -> None:
@@ -1466,9 +1693,13 @@ class App:
         self.lib = LibraryPage(self)
         self.pages["lib"] = self.lib
         for page in S.PAGES:
-            if page[0] == "lib":
+            if page[0] in ("lib", "lora"):
                 continue
             self.pages[page[0]] = ParamPage(self, page[0])
+        # LoRA 是独立页面（不是「加载参数」页里的小节了）
+        self.lora_page = LoRAPage(self)
+        self.lora_panel = self.lora_page.panel
+        self.pages["lora"] = self.lora_page
         for frame in self.pages.values():
             frame.grid(row=0, column=0, sticky="nsew")
             frame.grid_remove()
@@ -1491,17 +1722,18 @@ class App:
         self.rt_lbl.grid(row=0, column=0, sticky="w")
         right = ttk.Frame(bar, style="Bar.TFrame")
         right.grid(row=0, column=1, sticky="e")
-        self.rt_pct = ttk.Label(right, text="", style="Muted.TLabel", width=13)
+        # 已用上下文长度：只用文字显示（不再用进度条）
+        self.rt_pct = ttk.Label(right, text="", style="Muted.TLabel", width=30)
         self.rt_pct.pack(side="left", padx=(0, 6))
-        self.rt_prog = ttk.Progressbar(right, orient="horizontal", length=150,
-                                      mode="determinate", maximum=1000)
-        self.rt_prog.pack(side="left")
         Tooltip(self.rt_lbl, self._RT_HINT)
-        Tooltip(self.rt_prog, "当前上下文占用比例（已用 token ÷ 上下文长度）。")
+        Tooltip(self.rt_pct, "上下文占用：已用 token / 上下文长度（n_ctx）。")
 
     def _runtime_tick(self) -> None:
         if self.rt_lbl is None:
             return
+        # 把「目标模型」的路由 id 喂给 runtime，让它去查子模型真实数据
+        if self.router is not None and self.selected_model:
+            self.runtime.set_target(self.router_name_for(self.selected_model))
         snap = self.runtime.snapshot()
         parts: List[str] = []
         if not snap.get("attached"):
@@ -1509,13 +1741,13 @@ class App:
         elif not snap.get("alive"):
             text = "运行状态：%s" % (snap.get("error") or "后端无响应")
         else:
+            # 引擎 alive 就始终显示基础状态，不依赖是否有正在进行的请求
             if snap.get("gen_tps"):
                 parts.append("生成 %.0f t/s" % snap["gen_tps"])
             if snap.get("prompt_tps"):
                 parts.append("提示 %.0f t/s" % snap["prompt_tps"])
             if snap.get("kv_tier"):
                 if snap.get("vbr_active"):
-                    # 用户设的是 vbr，当前净值可能还是全 f16（没触发降级）
                     parts.append("KV vbr·当前 %s" % snap["kv_tier"])
                 else:
                     parts.append("KV %s" % snap["kv_tier"])
@@ -1524,27 +1756,36 @@ class App:
                     parts.append("已降级")
                 elif snap.get("floor_bpv"):
                     parts.append("未降级（下限 %.3g bpv）" % snap["floor_bpv"])
-            if snap.get("n_ctx"):
-                parts.append("上下文 %s / %d"
-                             % (snap.get("n_past") or 0, snap["n_ctx"]))
             if snap.get("budget_bytes"):
                 parts.append("KV 预算 %.2f GiB"
                              % (snap["budget_bytes"] / 1073741824.0))
             if snap.get("cache_n"):
                 parts.append("缓存命中 %d tok" % snap["cache_n"])
-            if snap.get("idle"):
-                parts.append("空闲")
-            text = "运行状态：" + (" · ".join(parts) if parts else "等待第一次请求")
+            # 上下文长度（n_ctx）：引擎自动算出或手动设置的都在这——直接并进主状态，
+            # 让「运行状态」里一定能看到（之前只放右侧 rt_pct，用户反馈没注意到）。
+            if snap.get("n_ctx"):
+                parts.append("上下文 %d" % int(snap["n_ctx"]))
+            if not parts:
+                # 引擎 alive 但还没采到任何数据（刚启动的前几秒 / 目标未加载）
+                text = "运行状态：已就绪"
+            else:
+                text = "运行状态：" + " · ".join(parts)
         try:
             self.rt_lbl.configure(text=text)
         except tk.TclError:
             return
-        ratio = snap.get("used_ratio")
-        if self.rt_prog is not None:
-            self.rt_prog.configure(value=int((ratio or 0) * 1000))
+        # 已用上下文长度：文字显示（不再用进度条）。主标签已显示总上下文长度，
+        # 这里只放「已用 token / 总长 · 百分比」，避免重复「上下文」字样。
         if self.rt_pct is not None:
-            self.rt_pct.configure(
-                text=("%.1f%% 已用" % (ratio * 100)) if ratio is not None else "")
+            if snap.get("n_ctx"):
+                np_ = int(snap.get("n_past") or 0)
+                ratio = snap.get("used_ratio")
+                t = "已用 %d/%d" % (np_, int(snap["n_ctx"]))
+                if ratio is not None:
+                    t += " · %.1f%%" % (ratio * 100)
+                self.rt_pct.configure(text=t)
+            else:
+                self.rt_pct.configure(text="")
 
     # ------------------------------------------------------------ 底部
     def _build_bottom(self) -> None:
@@ -1602,14 +1843,17 @@ class App:
         f.columnconfigure(1, weight=1)
         left = ttk.Frame(f, style="Bar.TFrame")
         left.grid(row=0, column=0, sticky="w")
-        self.btn_start = ttk.Button(left, text="▶  启动", style="Accent.TButton",
-                                    command=self.start_target)
-        self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(left, text="■  停止", style="Danger.TButton",
+        # 用户要求删掉底栏左下的「加载 LLM 默认模型」按钮（连带「默认模型」概念）。
+        # 启动入口保留两个：模型库页的「加载」按钮，以及快捷键 F5 / Ctrl+Enter。
+        self.btn_stop = ttk.Button(left, text="停止", style="Danger.TButton",
                                    command=self.stop_target)
-        self.btn_stop.pack(side="left", padx=(8, 0))
+        self.btn_stop.pack(side="left")
         self.btn_stop.state(["disabled"])
-        ttk.Button(left, text="↻  重启", style="TButton",
+        Tooltip(self.btn_stop,
+                "把所有已加载的模型都卸掉（显存还回去）。\n"
+                "路由进程留着，随时能再「加载」——\n"
+                "要单个卸载就用顶栏「已加载模型」里各自的按钮。")
+        ttk.Button(left, text="重载", style="TButton",
                    command=self.restart_target).pack(side="left", padx=(8, 0))
         self.detached_var = tk.BooleanVar(value=False)
         chk = ttk.Checkbutton(left, text="新控制台窗口（可交互）",
@@ -1622,8 +1866,7 @@ class App:
 
         right = ttk.Frame(f, style="Bar.TFrame")
         right.grid(row=0, column=2, sticky="e")
-        self.metric_lbl = ttk.Label(right, text="", style="Muted.TLabel")
-        self.metric_lbl.pack(side="right")
+        # 速度已统一在底部运行状态栏显示，不再单独放"最近速度"
         ttk.Button(right, text="切换模型（API）", style="Mini.TButton",
                    command=self.show_switch_dialog).pack(side="right",
                                                          padx=(0, 12))
@@ -1652,10 +1895,11 @@ class App:
         # 其余「运行模式」页面（对话 / 生成）各自一份运行参数
         if S.PAGE_KIND.get(page) == "run":
             return self.store.run_state(page)
-        if page in ("load", "chat", "spec"):
+        if page in ("load", "chat", "spec", "lora", "emb"):
             if not self.selected_model:
                 return {}
-            scope = "chat" if page == "chat" else "load"
+            scope = "chat" if page == "chat" else (
+                "emb" if page == "emb" else "load")
             return self.store.snapshot_ref(self.selected_model, scope)
         return {}
 
@@ -1687,7 +1931,7 @@ class App:
             srcs.append(self.store.run_state(mode))
         target = model or self.model_for(mode, role)
         if target:
-            for scope in ("load", "chat"):
+            for scope in ("load", "chat", "emb"):
                 got = self.store.state(target, scope)
                 if got:
                     srcs.append(got)
@@ -1696,6 +1940,8 @@ class App:
                 if k in snap and isinstance(v, dict):
                     snap[k] = {"on": bool(v.get("on")),
                                "value": v.get("value", "")}
+        # 「驻留策略」是纯界面项，这里翻译成引擎真正要的 --models-max（兜底）
+        snap = self._derive_residency(snap)
         # 挡位改名 / 类型变更后，老配置里的旧值要在这里就纠正过来，
         # 否则界面上会显示一个不存在的值、命令行里也会拼出引擎看不懂的东西
         for k, st in snap.items():
@@ -1715,9 +1961,51 @@ class App:
         return snap
 
     def model_for(self, mode: str, role: str = "llm") -> str:
-        if mode == "server":
-            return self.store.role_model(role)
+        """当前「目标模型」。只有一套：模型库里选中的那行（没有「默认模型」）。"""
         return self.selected_model
+
+    # ------------------------------------------------- 驻留策略 → --models-max
+    def _residency_numbers(self) -> Tuple[int, int, bool]:
+        """(LLM 上限, Embedding 上限, embedding 不计入)。"""
+        def num(key: str, fallback: int) -> int:
+            row = self.rows.get(key)
+            raw = row.get().get("value") if row is not None else ""
+            try:
+                return max(0, int(str(raw).strip()))
+            except (TypeError, ValueError):
+                return fallback
+        uncounted = False
+        row = self.rows.get("res_emb_uncounted")
+        if row is not None:
+            uncounted = bool(row.get().get("on"))
+        return num("res_llm_max", 1), num("res_emb_max", 2), uncounted
+
+    def _derive_residency(self, snap: Dict[str, Any]) -> Dict[str, Any]:
+        """把「驻留策略」那几个纯界面项翻译成引擎真正要的 ``--models-max``。
+
+        引擎只有一个**全局**上限，而且它的 LRU 驱逐不看模型类别 ——
+        传「LLM 上限」的话 embedding 一多就会被跨类踢掉。所以真正的按类限流
+        （LLM / Embedding 分开记账、超了顶掉同类最久没用的、两类各自的空闲
+        卸载计时）都在网关侧做；这个值只是**兜底**：
+
+            LLM 上限 + Embedding 上限 + 2 的余量
+
+        勾了「embedding 不计入驻留数量」就没有可算的上界了 → 传 0（不限制），
+        显存完全靠网关那边保证。
+        """
+        def num(key: str, fallback: int) -> int:
+            st = snap.get(key) or {}
+            try:
+                return max(0, int(str(st.get("value") or "").strip()))
+            except (TypeError, ValueError):
+                return fallback
+        uncounted = bool((snap.get("res_emb_uncounted") or {}).get("on"))
+        if uncounted:
+            total = 0
+        else:
+            total = (num("res_llm_max", 1) + num("res_emb_max", 2) + 2)
+        snap["models_max"] = {"on": True, "value": str(total)}
+        return snap
 
     # ==================================================================== #
     # 导航
@@ -1737,18 +2025,6 @@ class App:
         self.update_target_caption()
         self._refresh_cmd()
 
-    def make_custom_section(self, page: str, section: str,
-                            parent: tk.Widget, rowno: int) -> Optional[tk.Widget]:
-        """自定义小节（目前只有 LoRA 适配器）。"""
-        if page == "load" and section == "lora":
-            panel = LoRAPanel(self, parent)
-            panel.grid(row=rowno, column=0, columnspan=4, sticky="ew",
-                       pady=(2, 6))
-            self.lora_panel = panel
-            panel.reload()
-            return panel
-        return None
-
     def _load_page(self, page: str) -> None:
         if page == "lib":
             # 回到模型库时刷新一下：★（已单独调参）与扫描结果可能变了
@@ -1756,9 +2032,9 @@ class App:
                 self.lib.refresh_table()
             self.store.save()
             return
-        if page in ("load", "chat", "spec") and not self.selected_model:
+        if page in ("load", "chat", "spec", "lora") and not self.selected_model:
             self.log_append("还没选模型：请在「模型库」里选一行，"
-                            "加载/对话参数是按模型分别保存的。", "warn")
+                            "加载/对话/LoRA 参数都是按模型分别保存的。", "warn")
         for key, row in self.rows.items():
             if row.f.page == page:
                 row.set(self.initial_state(row.f))
@@ -1766,6 +2042,8 @@ class App:
             self._sync_role_fields()
         if page == "spec":
             self._sync_spec_fields()
+        if page == "lora" and self.lora_panel is not None:
+            self.lora_panel.reload()
         if page == "load" and self.lora_panel is not None:
             self.lora_panel.reload()
         self.store.save()
@@ -1820,8 +2098,8 @@ class App:
             u = self.unified
             bits.append("当前：%s" % (os.path.basename(u.model)
                                      if u.model else "未加载"))
-            bits.append("默认模型：%s" % (os.path.basename(model) if model
-                                         else "未指定"))
+            bits.append("目标：%s" % (os.path.basename(model) if model
+                                     else "未指定"))
         else:
             bits = ["%s（%s）" % (S.MODES[mode]["zh"], S.MODES[mode]["exe"])]
             if mode == "server":
@@ -1831,13 +2109,6 @@ class App:
             self.cmd_target.configure(text=" · ".join(bits))
         except (AttributeError, tk.TclError):
             pass
-        if hasattr(self, "btn_start"):
-            try:
-                label = (self._target_label_unified(role)
-                         if mode == "server" else self.target_label(mode, role))
-                self.btn_start.configure(text="▶  %s" % label)
-            except tk.TclError:
-                pass
         text = (os.path.basename(self.selected_model)
                 if self.selected_model else "未选择（去「模型库」点一行）")
         for lbl in getattr(self, "model_labels", []):
@@ -1850,24 +2121,10 @@ class App:
         """当前导航位置对应的「要启动的目标」：运行模式 + 角色。"""
         if self.page in ("lib", "server"):
             return "server", self.role
-        if self.page in ("load", "chat", "spec"):
-            # 编辑类页面：预览哪一个角色的命令，取决于正在编辑谁家的模型
-            for r in S.ROLE_ORDER:
-                if self.selected_model and model_key(
-                        self.store.role_model(r)) == model_key(
-                            self.selected_model):
-                    return "server", r
+        if self.page in ("load", "chat", "spec", "lora"):
+            # 编辑类页面：这些页面的参数是「按模型」存的，拼的是服务命令行
             return "server", self.role
         return S.PAGE_MODE[self.page], ""
-
-    @staticmethod
-    def target_label(mode: str, role: str) -> str:
-        if mode == "server":
-            return "启动 %s 服务" % S.ROLES[role]["zh"]
-        return "启动%s" % S.MODES[mode]["zh"]
-
-    def _target_label_unified(self, role: str) -> str:
-        return "加载 %s 默认模型" % S.ROLES[role]["zh"]
 
     # ==================================================================== #
     # 引擎与探测
@@ -2181,29 +2438,6 @@ class App:
     # ==================================================================== #
     # 角色
     # ==================================================================== #
-    def _fill_role_menu(self, role: str) -> None:
-        menu = self.role_widgets[role]["menu"]
-        menu.delete(0, "end")
-        if not self.lib_rows:
-            menu.add_command(label="（先去模型库扫描一次）", state="disabled")
-        for r in self.lib_rows[:60]:
-            extra = (" · %s" % r["quant"]) if r.get("quant") else ""
-            menu.add_command(
-                label="%s  %s%s" % (r.get("pip", ""), r["name"][:48], extra),
-                command=lambda p=r["path"]: self.assign_role(role, p,
-                                                             start=False))
-        menu.add_separator()
-        menu.add_command(label="浏览 GGUF…",
-                         command=lambda: self.pick_model_for(role))
-
-    def pick_model_for(self, role: str) -> None:
-        path = filedialog.askopenfilename(
-            parent=self.root, initialdir=self.default_dir(),
-            title="选择 GGUF 模型",
-            filetypes=[("GGUF 模型", "*.gguf"), ("全部文件", "*.*")])
-        if path:
-            self.assign_role(role, os.path.normpath(path), start=False)
-
     def autofill_mmproj(self, row: Dict[str, Any]) -> None:
         """视觉模型同目录有 mmproj 就自动填进 --mmproj，省得手找。"""
         mm = row.get("mmproj")
@@ -2242,18 +2476,6 @@ class App:
             return False, ""
         return bool(f.on), f.default_value()
 
-    def auto_switch_on(self) -> bool:
-        return self._role_setting("auto_switch")[0]
-
-    def idle_unload_minutes(self) -> int:
-        on, val = self._role_setting("idle_unload")
-        if not on:
-            return 0
-        try:
-            return max(0, int(str(val).strip() or 0))
-        except (TypeError, ValueError):
-            return 0
-
     def gateway_endpoint(self) -> Tuple[str, int]:
         """统一模式的网关地址 = 服务页填的 host / port。"""
         _on, host = self._role_setting("host")
@@ -2265,9 +2487,11 @@ class App:
         return (host.strip() or "127.0.0.1"), p
 
     def default_model_for(self, role: str = "llm") -> str:
-        if role not in S.ROLES:
-            role = "llm"
-        return self.store.role_model(role)
+        """（历史名）网关给「没写 model 的请求」兜底的模型。
+
+        不再有「默认模型」这一说 —— 直接用当前选中的目标模型。
+        """
+        return self.selected_model
 
     def role_for_path(self, path: str) -> str:
         """只有一个角色，服务参数也就只有一套。"""
@@ -2326,14 +2550,18 @@ class App:
         stem = os.path.splitext(os.path.basename(path))[0]
         return re.sub(r"-\d{5}-of-\d{5}$", "", stem)
 
-    def assign_role(self, role: str, path: str, start: bool = False) -> None:
+    def set_target_model(self, path: str, start: bool = False) -> None:
+        """把某个模型设为「目标模型」（= 模型库里选中的那个）。
+
+        原来这里叫 ``assign_role``：会写一份持久化的「默认模型」。用户要求去掉
+        「默认模型」这套东西，所以现在只做三件事 —— 设目标、记一笔「最近使用」
+        （重启后用来恢复）、刷新界面。
+        """
         if not path:
             return
-        self.store.set_role_model(role, path)
+        self.selected_model = path
         self.store.push_unique("recent_models", path)
         self.store.save()
-        if not self.selected_model:
-            self.selected_model = path
         row = next((r for r in self.lib_rows
                     if model_key(r["path"]) == model_key(path)), None)
         if row:
@@ -2342,17 +2570,17 @@ class App:
                                 "它起不来（llama-server 会报架构不支持）。"
                                 % row["name"], "warn")
             self.lib.refresh_table()
-        self.log_append("当前模型已指定：%s" % os.path.basename(path), "sys")
+        self.log_append("目标模型已指定：%s" % os.path.basename(path), "sys")
         if self.page in ("load", "chat", "spec"):
             self._load_page(self.page)
         self._refresh_role_slots()
         self.update_target_caption()
         if start:
-            self.start_role(role)
+            self.start_role()
 
     def toggle_role(self, role: str) -> None:
         cur = self.unified.model
-        want = self.store.role_model(role)
+        want = self.selected_model
         if cur and want and model_key(cur) == model_key(want) \
                 and self.manager.get("unified").running:
             self.stop_unified_backend()
@@ -2361,7 +2589,7 @@ class App:
 
     def start_role(self, role: str = "llm", model_override: str = "",
                    quiet: bool = False) -> bool:
-        target = model_override or self.store.role_model(role)
+        target = model_override or self.selected_model
         res = self.start_unified_backend(target)
         if res.get("ok"):
             self.last_start_error = ""
@@ -2396,15 +2624,6 @@ class App:
         return env
 
     # ------------------------------------------------- 多模型路由（buun 独有）
-    def router_mode(self) -> bool:
-        """当前服务是不是跑在「多模型路由」方式下（网关据此退化为纯透传）。"""
-        try:
-            path = self.store.role_model("llm")
-            snap = self.effective_snapshot("server", "llm", path)
-            return S.is_router(snap)
-        except Exception:  # noqa: BLE001
-            return False
-
     @staticmethod
     def _safe_ini_name(name: str) -> str:
         """INI 段名里不能出现 ] 和 :（: 会被当成量化后辍处理）。"""
@@ -2423,15 +2642,49 @@ class App:
         return self._safe_ini_name(
             os.path.splitext(os.path.basename(path))[0])
 
+    def _classify_path(self, path: str) -> str:
+        """这个模型算 LLM / embedding / drafter（按类限流 / 空闲卸载要用）。"""
+        low = os.path.normcase(str(path))
+        for r in getattr(self, "lib_rows", []) or []:
+            if os.path.normcase(str(r.get("path") or "")) == low:
+                cat = r.get("category")
+                if cat == "Embedding":
+                    return "emb"
+                if cat == "Drafters":
+                    return "drafter"
+                return "llm"
+        try:
+            return "emb" if B.is_embedding_model(path) else "llm"
+        except Exception:  # noqa: BLE001
+            return "llm"
+
+    def router_kind_of(self, name: str) -> str:
+        """段名 → 类别。认不出来的按 LLM 算（只有 HF 缓存里冒出来的才会）。"""
+        return str(getattr(self, "router_kind_map", {}).get(name) or "llm")
+
     def router_entries(self, current: str = "") -> List[Tuple[str, str, Dict[str, Any]]]:
-        """所有「配过参数或预设」的模型 + 当前选中的模型，去重后的列表。"""
+        """预置文件里要声明的所有模型：**模型库里扫到的全部**（外加当前选中的）。
+
+        为什么是「全部」而不是「只配过参数的」：路由**只能加载已经在预置文件里
+        声明过的模型** —— `POST /models/load` 对不在清单里的名字直接返回
+        not found。既然「加载」按钮要能加载任意一个模型，清单就得先铺全。
+        每段至少写一行 `model = 路径`，成本极低（只有真正被 load 的才占显存）。
+
+        顺便重建「段名 → 类别 / 路径」两张表，供按类限流与列表显示用。
+        """
         paths: List[str] = []
+        for r in getattr(self, "lib_rows", []) or []:
+            p = str(r.get("path") or "")
+            if p and p not in paths:
+                paths.append(p)
         for p in ([current] if current else []) + \
                 list(self.store.configured_models()):
             if p and p not in paths:
                 paths.append(p)
         out: List[Tuple[str, str, Dict[str, Any]]] = []
         used: Dict[str, str] = {}
+        kinds: Dict[str, str] = {}
+        pathmap: Dict[str, str] = {}
         for p in paths:
             if not os.path.isfile(p):
                 continue
@@ -2443,17 +2696,25 @@ class App:
                 name = "%s-%d" % (name, i)
             used[name] = p
             out.append((name, p, MG.merge_model_snapshot(self.store, p)))
+            kinds[name] = self._classify_path(p)
+            pathmap[name] = p
+        self.router_kind_map = kinds
+        self.router_path_map = pathmap
         return out
 
     def preset_ini_text(self, current: str = "") -> str:
-        """生成路由预置 INI 的文本。[*] 用当前模型的全套参数当全局默认。"""
-        snap = self.effective_snapshot("server", "llm", current)
-        return B.preset_ini(self.router_entries(current), snap,
+        """生成路由预置 INI 的文本。
+
+        ⚠️ 不往 ``[*]`` 里塞任何东西：它跟「路由器命令行」一样是**全局**的，
+        引擎会把 ``[*]`` merge（覆盖）进每个模型段 —— 塞了某个模型的参数，
+        所有模型就被锁成同一套了。模型参数只写各自的段。
+        """
+        return B.preset_ini(self.router_entries(current), None,
                             engine_hint=self.engine_var.get().strip())
 
     def export_router_preset(self) -> None:
         """「导出路由预置 INI」按钮：写到用户选的位置并把字段填上。"""
-        cur = self.selected_model or self.store.role_model("llm")
+        cur = self.selected_model
         text = self.preset_ini_text(cur)
         init = self.store.config_dir
         path = filedialog.asksaveasfilename(
@@ -2473,30 +2734,299 @@ class App:
 
     def _prepare_router(self, snap: Dict[str, Any],
                         current: str) -> List[str]:
-        """路由模式启动前：补模型来源 + 生成 preset INI。"""
-        notes: List[str] = []
-        md = snap.get("models_dir") or {}
-        if not (md.get("on") and str(md.get("value") or "").strip()):
-            root = str(self.store.get("models_dir") or "").strip()
-            if root:
-                snap["models_dir"] = {"on": True, "value": root}
-                notes.append("路由模型目录留空，自动用模型库根目录：%s" % root)
+        """路由启动前：生成 preset INI 并把路径填进快照。
 
-        mp = snap.get("models_preset") or {}
-        if mp.get("on") and str(mp.get("value") or "").strip():
-            notes.append("使用你指定的路由预置文件：%s" % mp["value"])
-            return notes
-        text = self.preset_ini_text(current)
+        每次都重新生成 —— 模型库扫到的东西和各自的参数都可能变了，
+        反正只是写一个几 KB 的文本文件。
+        """
+        notes: List[str] = []
+        entries = self.router_entries(current)
+        text = B.preset_ini(entries, None,
+                            engine_hint=self.engine_var.get().strip())
         path = os.path.join(self.store.config_dir, "router-preset.ini")
         if B.write_ini(path, text):
             snap["models_preset"] = {"on": True, "value": path}
-            notes.append("已生成路由预置文件：%s（%d 个模型；"
-                         "命令行上的参数不会传给各模型，模型参数全部来自这里）"
-                         % (path, len(self.router_entries(current))))
+            names = [n for n, _p, _s in entries]
+            emb = sum(1 for n, p, _s in entries
+                      if self._classify_path(p) == "emb")
+            notes.append("已生成预置文件：%s（%d 个模型，其中 %d 个 embedding）"
+                         % (path, len(entries), emb))
+            if not names:
+                notes.append("⚠ 模型库里一个模型都没有 —— 先到「模型库」页"
+                             "选目录并扫描，否则路由起来也是空的。")
         else:
-            notes.append("警告：生成路由预置文件失败（%s 不可写），"
-                         "各模型将只拿引擎默认参数。" % path)
+            notes.append("警告：生成预置文件失败（%s 不可写），"
+                         "各模型会拿不到自己的参数。" % path)
         return notes
+
+    def show_emb_dialog(self, path: str = "") -> None:
+        """给 embedding / reranker 模型弹专属设置小窗口。"""
+        target = path or self.selected_model
+        if not target:
+            messagebox.showinfo("先选模型",
+                                "请在「模型库」里选中一个 embedding 模型。",
+                                parent=self.root)
+            return
+        self.selected_model = target
+        dlg = getattr(self, "_emb_dialog", None)
+        if dlg is not None and dlg.winfo_exists():
+            dlg.close()
+        self._emb_dialog = EmbDialog(self, target)
+
+    # ==================================================================== #
+    # 多模型路由：加载 / 卸载 / 重载（需求 2 与 4）
+    # ==================================================================== #
+    def _row_int(self, key: str, fallback: int) -> int:
+        row = self.rows.get(key)
+        raw = row.get().get("value") if row is not None else ""
+        try:
+            return max(0, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            return fallback
+
+    def sync_residency_policy(self) -> None:
+        """把「驻留策略」小节的当前取值推给 RouterMonitor。"""
+        llm, emb, uncounted = self._residency_numbers()
+        pol = self.router_policy
+        pol.llm_max = llm
+        pol.emb_max = emb
+        pol.emb_uncounted = uncounted
+        pol.llm_idle_min = self._row_int("res_llm_idle", 15)
+        pol.emb_idle_min = self._row_int("res_emb_idle", 30)
+
+    def rebuild_presets(self) -> bool:
+        """重新生成预置 INI，并让引擎重读一遍（改完参数后必须做）。"""
+        self.sync_residency_policy()
+        path = os.path.join(self.store.config_dir, "router-preset.ini")
+        entries = self.router_entries(self.selected_model)
+        text = B.preset_ini(entries, None,
+                            engine_hint=self.engine_var.get().strip())
+        if not B.write_ini(path, text):
+            self.log_append("写预置文件失败：%s" % path, "err")
+            return False
+        self.set_row_value("models_preset", path, on=True)
+        if self.manager.get("unified").running:
+            ok, msg = self.router.reload_presets()
+            if not ok:
+                self.log_append("引擎重读预置失败：%s" % msg, "warn")
+        self.log_append("预置文件已重建（%d 个模型）" % len(entries), "sys")
+        self.audit_preset_models(entries, path)
+        return True
+
+    # 体检时忽略这些 key：它们是**服务进程级**的（有没有预置文件、端口、
+    # 引擎在不在），跟单个模型没关系 —— 拿它们当模型的问题会把日志刷满。
+    _AUDIT_SKIP = frozenset(("models_preset", "port", "host", "__engine__",
+                             "__model__"))
+
+    def audit_preset_models(self, entries: List[Tuple[str, str, Dict[str, Any]]],
+                            preset_path: str = "") -> None:
+        """逐个模型体检，只记日志、不拦。
+
+        路由模式下每个模型是**独立子进程**：某个模型的参数不成立时，只有它
+        自己起不来，路由器本身没事 —— 所以这里不能拦，但必须说清楚。
+
+        不这么做的话，用户在 API 那边只会看到引擎一句「failed to load /
+        子进程退出码 1」，根本不知道是自己把推测方式设成了 DSpark 却没指定
+        草稿模型。踩过：模型的存档里 spec-type=draft-dspark 但没有 model-draft。
+        """
+        exe = B.resolve_exe(self.engine_var.get().strip(), "server")
+        if not exe:
+            return
+        warned = 0
+        for name, model_path, snap in entries:
+            audit = dict(snap or {})
+            if preset_path:
+                audit["models_preset"] = {"on": True, "value": preset_path}
+            try:
+                errs = [e for e in B.validate(audit, "server", exe,
+                                              model=model_path, role="llm")
+                        if e[0] not in self._AUDIT_SKIP]
+            except Exception:      # noqa: BLE001
+                continue
+            if not errs:
+                continue
+            msg = str(errs[0][1]).splitlines()[0]
+            hint = ""
+            if ("草稿模型" in msg) and B._model_has_mtp(model_path):
+                hint = ("（这个模型自带 MTP 预测头：[推测解码] 页把方式改成 "
+                        "MTP 就不需要草稿模型了）")
+            self.log_append("「%s」的参数有问题，它加载时会失败：%s%s"
+                            % (name, msg, hint), "warn")
+            warned += 1
+            if warned >= 5:
+                self.log_append("……还有更多模型参数有问题，先修上面这几个",
+                                "warn")
+                break
+
+    def router_name_for(self, path: str) -> str:
+        """模型路径 → 路由里的段名。"""
+        want = os.path.normcase(str(path or ""))
+        for name, p in (self.router_path_map or {}).items():
+            if os.path.normcase(p) == want:
+                return name
+        # 表还没建（没扫描过 / 刚起来）→ 退化成按显示名算
+        return self.router_model_name(path)
+
+    def router_load(self, path: str = "") -> bool:
+        """加载一个模型（默认「目标模型」）。后端没起来就顺手把整条路由拉起来。"""
+        target = path or self.selected_model
+        if not target or not os.path.isfile(target):
+            messagebox.showinfo(
+                "先选模型",
+                "请在「模型库」里选中一行（或用「设为目标模型」指定），\n"
+                "再点「加载」。", parent=self.root)
+            return False
+        # Drafters 不能单独加载，只能通过推测解码参数关联
+        if self._classify_path(target) == "drafter":
+            messagebox.showinfo(
+                "不能单独加载草稿模型",
+                "草稿模型（Drafter）不能单独加载到路由里。\n"
+                "请在「推测解码」参数里配好草稿模型，它会跟随主 LLM 一起加载。",
+                parent=self.root)
+            return False
+        base = os.path.basename(target)
+        if not self.manager.get("unified").running:
+            self.log_append("路由后端没在运行，先把它拉起来（顺便加载 %s）"
+                            % base, "sys")
+            self.selected_model = target
+            return self.start_role("llm", model_override=target)
+        if not self.rebuild_presets():
+            return False
+        name = self.router_name_for(target)
+        ok, msg = self.router.load(name)
+        self.log_append("加载「%s」：%s" % (name, msg), "ok" if ok else "err")
+        if ok:
+            self.mark_loaded(name)
+        self.refresh_loaded_models()
+        return ok
+
+    def router_unload_name(self, name: str) -> None:
+        ok, msg = self.router.unload(name)
+        self.log_append("卸载「%s」：%s" % (name, msg), "warn" if ok else "err")
+        self.refresh_loaded_models()
+
+    def router_unload_path(self, path: str) -> None:
+        """模型库页的「卸载」按钮：按路径找到段名再卸。"""
+        name = self.router_name_for(path)
+        if name not in (self.router.loaded_names() or []):
+            messagebox.showinfo(
+                "未加载",
+                "「%s」当前没有驻留。\n（只有已加载的模型才能卸载）"
+                % os.path.basename(path), parent=self.root)
+            return
+        self.router_unload_name(name)
+
+    def router_unload_all(self) -> None:
+        names = self.router.loaded_names()
+        if not names:
+            self.log_append("当前没有已加载的模型。", "sys")
+            return
+        n = self.router.unload_all()
+        self.log_append("已请求卸载全部 %d 个模型（路由进程留着，随时可以再加载）"
+                        % n, "warn")
+        self.refresh_loaded_models()
+
+    def mark_loaded(self, name: str) -> None:
+        if name and name not in self.router_history:
+            self.router_history.append(name)
+        self.router.touch(name)
+
+    def reload_models(self) -> None:
+        """「重载」：重建预置 → 引擎重读 → 把加载过的模型重新加载一遍。
+
+        目标 = 当前驻留的 ∪ 本次会话加载过的（含刚被策略顶掉 / 手动卸载的）。
+        逐个重载 —— 会重新走一遍加载，所以新参数立刻生效，而且**不用重启
+        路由进程**（其他模型全程不受影响）。
+        超过「驻留策略」上限时，多出来的会被策略按 LRU 顶掉（日志里会写明）。
+        """
+        st = self.manager.get("unified")
+        if not st.running:
+            self.log_append("路由后端没在运行，重载改成「启动」：加载目标模型",
+                            "sys")
+            self.router_load()
+            return
+        targets: List[str] = []
+        for name in (self.router.loaded_names() or []) + list(self.router_history):
+            if name and name not in targets:
+                targets.append(name)
+        if not targets:
+            self.log_append("还没有加载过任何模型，先点「加载」。", "warn")
+            return
+        if not self.rebuild_presets():
+            return
+        self.log_append("重载 %d 个模型（重新读 config\\models 里的参数）：%s"
+                        % (len(targets), "、".join(targets)), "sys")
+        for name in targets:
+            ok, msg = self.router.reload_model(name)
+            self.log_append("  重载「%s」：%s" % (name, msg),
+                            "ok" if ok else "err")
+            if ok:
+                self.mark_loaded(name)
+        self.sync_residency_policy()
+        self.refresh_loaded_models()
+
+    def refresh_loaded_models(self) -> None:
+        """按 RouterMonitor 的最新清单重画「已加载模型」列表。"""
+        box = getattr(self, "loaded_box", None)
+        if box is None:
+            return
+        if getattr(self, "loaded_sig", None) == self._loaded_signature():
+            return                       # 没变化就别重建控件（免得闪烁）
+        self.loaded_sig = self._loaded_signature()
+        for w in box.winfo_children():
+            w.destroy()
+        snap = self.router.snapshot()
+        if not snap.get("active"):
+            ttk.Label(box, text=("路由后端没在运行 —— 点「加载」会把它拉起来"),
+                      style="Muted.TLabel").pack(side="left")
+            return
+        models = snap.get("models") or []
+        resident = [m for m in models if m.get("status") in ROU.RESIDENT]
+        # 过滤掉 Drafters：草稿模型跟随主 LLM 一起加载，不在顶栏单独显示
+        resident = [m for m in resident
+                    if self.router_kind_of(str(m.get("id"))) != "drafter"]
+        if not resident:
+            ttk.Label(box, text="当前没有已加载的模型（点「加载」把目标模型装进来）",
+                      style="Muted.TLabel").pack(side="left")
+            return
+        pol = self.router_policy
+        for m in resident:
+            name = str(m.get("id"))
+            kind = self.router_kind_of(name)
+            st = str(m.get("status"))
+            colour = C["warn"] if st in ("loading", "sleeping") else C["ok"]
+            row = ttk.Frame(box, style="Alt.TFrame", padding=(8, 3))
+            row.pack(side="left", padx=(0, 6))
+            ttk.Label(row, text="\u25cf", style="Alt.TLabel",
+                      foreground=colour).pack(side="left")
+            ttk.Label(row, text=name[:34], style="Alt.TLabel",
+                      font=T.FONT_UI_BOLD).pack(side="left", padx=(4, 6))
+            limit = pol.limit_for(kind)
+            tag = "%s · %s%s" % (
+                "LLM" if kind == "llm" else "Embedding",
+                ROU.STATUS_ZH.get(st, st),
+                "" if limit is None else "（%s 上限 %d）"
+                % ("LLM" if kind == "llm" else "Emb", limit))
+            ttk.Label(row, text=tag, style="MutedAlt.TLabel").pack(side="left")
+            ttk.Button(row, text="卸载", style="Tiny.TButton",
+                       command=lambda n=name: self.router_unload_name(n)
+                       ).pack(side="left", padx=(8, 0))
+
+    def _loaded_signature(self) -> Tuple:
+        snap = self.router.snapshot()
+        return (bool(snap.get("active")),
+                tuple((str(m.get("id")), str(m.get("status")))
+                      for m in snap.get("models") or []))
+
+    def _router_tick(self) -> None:
+        """约每秒一次：同步驻留策略 → 重画目标/已加载/底栏。
+
+        限流与空闲卸载不在这里做 —— 那在 RouterMonitor 的后台线程里
+        （它才是唯一知道「每个模型最后一次被请求是什么时候」的地方）。
+        """
+        self.sync_residency_policy()
+        self._refresh_role_slots()
+        self._update_buttons()
 
     def set_row_value(self, key: str, value: str, on: bool = True) -> None:
         row = self.rows.get(key)
@@ -2533,7 +3063,10 @@ class App:
         if router:
             for note in self._prepare_router(snap, path):
                 self.log_append("路由模式：" + note, "sys")
-        errs = B.validate(snap, "server", exe, model=path, role=role)
+        # 路由模式下不做「针对这一个模型」的校验：路由器自己不带 -m，
+        # 模型参数全在预置文件里，按目标模型卡住会让别的模型也起不来
+        errs = B.validate(snap, "server", exe, model=path, role=role,
+                          model_checks=not router)
         if errs:
             msg = "；".join(m for _k, m in errs[:3])
             self.log_append("启动失败：%s" % msg, "err")
@@ -2564,6 +3097,8 @@ class App:
         self._last_unified_argv = argv
         # 开始采集运行时状态（/props + /slots 都在这个内部端口上）
         self.runtime.attach(internal, os.path.basename(path))
+        # 模型清单轮询 + 按类限流 + 空闲卸载都挂到这个内部端口上
+        self.router.attach(internal)
         self._refresh_role_slots()
         self._update_buttons()
         return {"ok": True, "port": internal, "role": role, "model": path}
@@ -2576,7 +3111,8 @@ class App:
             self.manager.stop("unified")
         self.unified.mark_stopped()
         self.runtime.detach()
-        self.log_append("统一后端已停止，显存已释放", "warn")
+        self.router.mark_stopped()
+        self.log_append("路由已停止，所有模型子进程一并结束、显存已释放", "warn")
         self._refresh_role_slots()
         self._update_buttons()
 
@@ -2616,7 +3152,9 @@ class App:
         if not os.path.isfile(full):
             return {"ok": False, "error": "文件不存在：%s" % full}
         st = self.manager.get(role)
-        self.store.set_role_model(role, full)
+        # 不再记「默认模型」：只把请求里的模型用起来
+        self.selected_model = full
+        self.store.push_unique("recent_models", full)
         self.store.save()
         self.log_append("[%s] 切换 %s 角色 → %s"
                         % (source, S.ROLES[role]["zh"],
@@ -2670,34 +3208,45 @@ class App:
         self._refresh_unified_slots()
 
     def _refresh_unified_slots(self) -> None:
-        """只有一张卡片：统一后端当前 / 默认的那个模型。"""
-        cur = self.unified.model
+        """画「目标模型」卡片 + 「已加载模型」列表。
+
+        ⚠️ 这里说的「目标模型」= 模型库里选中的那个（或上次作为角色模型启动的
+        那个）。用户要求去掉「选模型 / 设为当前」两个按钮，所以目标完全跟着
+        模型库的选中行走；要加载它只要点「加载」。
+        """
+        self.sync_residency_policy()
         host, port = self.gateway_endpoint()
-        for role in S.ROLE_ORDER:
-            w = self.role_widgets[role]
-            w["title"].configure(text="当前模型")
-            model = self.store.role_model(role) or cur
-            w["name"].configure(text=("模型：%s" % os.path.basename(model)[:48])
-                                if model else "模型：未指定")
-            loaded = bool(cur and model and model_key(cur) == model_key(model))
-            if loaded and self.manager.get("unified").running:
-                if self.unified.loading:
-                    txt, colour = "正在加载…", C["warn"]
-                elif self.unified.ready:
-                    txt, colour = "已驻留", C["ok"]
-                else:
-                    txt, colour = "已启动（未就绪）", C["warn"]
-                w["dot"].configure(text="\u25cf", foreground=colour)
-                w["act"].configure(text="停止")
-                w["unload"].state(["!disabled"])
-            else:
-                txt = "待切换" if cur else "未加载"
-                w["dot"].configure(text="\u25cb", foreground=C["muted"])
-                colour = C["muted"]
-                w["act"].configure(text="设为当前")
-                w["unload"].state(["disabled"])
-            w["state"].configure(text="%s · 端口 %s" % (txt, port),
+        running = self.manager.get("unified").running
+        model = self.selected_model
+        if model:
+            self.target_name.configure(text=os.path.basename(model)[:52])
+        else:
+            self.target_name.configure(text="未指定（去模型库选一行）")
+
+        resident = self.router.loaded_names() if running else []
+        if not running:
+            state, colour = "路由未启动 · 点「加载」会把它拉起来", C["muted"]
+        elif self.unified.loading:
+            state, colour = "路由正在启动…", C["warn"]
+        elif any(True for _ in resident):
+            state, colour = ("已驻留 %d 个模型 · 统一端口 %s"
+                             % (len(resident), port)), C["ok"]
+        else:
+            state, colour = "路由已就绪（还没有模型驻留）", C["ok"]
+        self.target_dot.configure(text="\u25cf" if running else "\u25cb",
                                  foreground=colour)
+        self.target_state.configure(text=state, foreground=colour)
+        pol = self.router_policy
+        llm_n = sum(1 for n in resident if self.router_kind_of(n) == "llm")
+        emb_n = len(resident) - llm_n
+        lim_llm = pol.limit_for("llm")
+        lim_emb = pol.limit_for("emb")
+        self.loaded_count.configure(
+            text=("已驻留 LLM %d%s · Embedding %d%s"
+                  % (llm_n, "" if lim_llm is None else "/%d" % lim_llm,
+                     emb_n, "（不计入）" if lim_emb is None else "/%d" % lim_emb))
+            if running else "")
+        self.refresh_loaded_models()
         self._paint_global_status()
 
     def _paint_global_status(self) -> None:
@@ -2764,28 +3313,31 @@ class App:
     # 启动 / 停止 / 重启
     # ==================================================================== #
     def start_target(self) -> None:
+        """底栏「加载」：服务模式装模型；对话/生成模式起一次性进程。"""
         self.collect(self.page)
         mode, role = self.target()
         if mode == "server":
-            self.start_role(role)
+            self.router_load()
         else:
             self.start_single(mode)
 
     def stop_target(self) -> None:
+        """底栏「停止」：服务模式 = 卸载全部模型（路由进程留着）。"""
         mode, role = self.target()
         if mode == "server":
-            self.stop_role(role)
+            self.router_unload_all()
         else:
             self.stop_single()
 
     def restart_target(self) -> None:
+        """底栏「重载」：重新读 config\\models 里的参数并重装模型。
+
+        服务模式 = 重建预置 → 引擎重读 → 把加载过的模型逐个重装（不重启进程）；
+        对话 / 生成模式仍是一次性进程的「重启」。
+        """
         mode, role = self.target()
         if mode == "server":
-            if self.manager.get(role).running:
-                self.stop_role(role)
-                self.root.after(900, lambda: self.start_role(role))
-            else:
-                self.start_role(role)
+            self.reload_models()
         else:
             if self.manager.get("single").running:
                 self.stop_single()
@@ -2807,10 +3359,20 @@ class App:
                                parent=self.root)
 
     def _update_buttons(self) -> None:
-        mode, role = self.target()
-        running = (self.manager.get(role).running if mode == "server"
-                   else self.manager.get("single").running)
-        self.btn_stop.state(["!disabled"] if running else ["disabled"])
+        """底栏三个按钮的可用性。
+
+        ⚠️ 这里原来查的是 ``manager.get(role)``（role = "llm"），但后端进程实际
+        注册在 ``"unified"`` 这个 key 上 —— 查不到就新建一个空的 RoleState，
+        ``running`` 永远是 False，于是「停止」加载完模型也一直是灰的。
+        这就是用户报的「停止按钮无作用」，修在取 key 这一步。
+        """
+        mode, _role = self.target()
+        if mode == "server":
+            busy = bool(self.router.loaded_names())
+            self.btn_stop.state(["!disabled"] if busy else ["disabled"])
+        else:
+            running = self.manager.get("single").running
+            self.btn_stop.state(["!disabled"] if running else ["disabled"])
 
     # ==================================================================== #
     # 命令行预览
@@ -2823,6 +3385,28 @@ class App:
         snap = self.effective_snapshot(mode, role, model)
         return exe, self.build_argv_checked(snap, mode, model=model,
                                             role=role, exe=exe)
+
+    def model_ini_preview(self) -> str:
+        """当前选中模型在路由预置文件里的那一段（含状态提示）。"""
+        path = self.selected_model
+        self.collect(self.page)
+        snap = MG.merge_model_snapshot(self.store, path)
+        name = self.router_model_name(path)
+        ini_path = os.path.join("config", "router-preset.ini")
+        head = ("; ↓ 这一段会写进路由预置文件 %s\n"
+                "; 服务只剩「多模型路由」一种跑法：模型参数**不进命令行**，\n"
+                "; 因为路由器会把自身命令行 merge（覆盖）进所有模型。\n"
+                "; 所以模型级参数只写在各自的段里。改完点底栏「重载」生效。\n\n"
+                % ini_path)
+        st = ""
+        if self.manager.get("unified").running:
+            cur = ""
+            for m in (self.router.snapshot().get("models") or []):
+                if m.get("id") == name:
+                    cur = ROU.STATUS_ZH.get(str(m.get("status")), "")
+                    break
+            st = "\n\n; 该模型当前状态：%s" % (cur or "未加载")
+        return head + B.preset_section(name, path, snap) + st
 
     def schedule_refresh(self) -> None:
         if self._refresh_pending:
@@ -2854,6 +3438,14 @@ class App:
         if not hasattr(self, "cmd_view"):
             return
         mode, _role = self.target()
+        # 模型级页面（加载/对话/推测/LoRA/embedding）显示的是「这个模型会写进
+        # 路由预置的那一段」—— 模型参数现在不进命令行了，看命令行没有意义。
+        if self.page in ("load", "chat", "spec", "lora", "emb") \
+                and self.selected_model:
+            self.cmd_view.set_text(self.model_ini_preview())
+            self._update_engine_label()
+            self.update_target_caption()
+            return
         exe, argv = self.current_argv()
         if exe:
             text = (B.format_multiline(os.path.basename(exe), argv)
@@ -2999,8 +3591,7 @@ class App:
                 break
             self.log_append(line, tag)
         if self._tick % 6 == 0:
-            self._refresh_role_slots()
-            self._update_buttons()
+            self._router_tick()
         if self._tick % 8 == 0:
             self._runtime_tick()
         self.root.after(150, self._pump)
@@ -3013,15 +3604,7 @@ class App:
             if len(buf) > 400:
                 del buf[:len(buf) - 400]
             self.log_view.append(ev.text, classify(ev.text))
-            low = ev.text.lower()
-            if "tokens per second" in low or " t/s" in low:
-                for pat in RESULT_PATTERNS:
-                    m = pat.search(ev.text)
-                    if m:
-                        self.last_ts = m.group(1)
-                        self.metric_lbl.configure(
-                            text="最近速度：%s t/s" % self.last_ts)
-                        break
+            # 速度已统一在底部运行状态栏显示，不再从进程日志解析
         elif isinstance(ev, P.StartedEvent):
             self.out_tail[key] = []      # 新进程，旧的报错别串到这次的诊断里
             self.log_append("[%s] 进程已启动，PID %d" % (who, ev.pid), "ok")
@@ -3347,15 +3930,7 @@ class App:
         btns.pack(fill="x", padx=16, pady=(0, 14))
         ttk.Button(btns, text="切换", style="Accent.TButton",
                    command=do_switch).pack(side="left")
-        ttk.Button(btns, text="设为当前模型并编辑参数", style="Mini.TButton",
-                   command=lambda: (self.assign_role("llm",
-                                                    next((r["path"]
-                                                          for r in self.lib_rows
-                                                          if r["name"]
-                                                          == var.get()), ""),
-                                                    start=False),
-                                    self.show("load"))).pack(side="left",
-                                                             padx=(8, 0))
+        # 「设为当前模型并编辑参数」已删除（用户要求去掉「设置默认模型」入口）。
         ttk.Button(btns, text="关闭", style="Mini.TButton",
                    command=win.destroy).pack(side="right")
 
@@ -3408,10 +3983,7 @@ class App:
         d = str(self.store.get("models_dir") or "")
         if self.lib and d:
             self.lib.dir_var.set(d)
-        for role in S.ROLE_ORDER:
-            p = self.store.role_model(role)
-            if p and os.path.isfile(p):
-                self.selected_model = self.selected_model or p
+        # 没有「默认模型」可读了 —— 恢复「上次用过的模型」就够了（最近使用列表）。
         recent = list(self.store.get("recent_models") or [])
         if not self.selected_model and recent and os.path.isfile(recent[0]):
             self.selected_model = recent[0]

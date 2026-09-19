@@ -26,12 +26,14 @@ from . import engine as E
 from . import gguf as G
 from . import manager as MG
 from . import probe as PR
+from . import router as ROU
 from . import scan as SC
 from . import schema as S
 from . import theme as T
 from .store import model_key
 from . import control_api as C
 from .unified import UnifiedBackend
+from . import ui as U
 from .ui import APP_TITLE, App
 
 
@@ -189,6 +191,29 @@ def _make_fake_lib(root: str) -> List[str]:
 # 自检
 # --------------------------------------------------------------------------- #
 
+def _ini_tokens(name: str, path: str, snap: Dict[str, Any]) -> List[str]:
+    """把「这个模型会写进预置 INI 的那一段」拆成 token 列表。
+
+    v3.0.0 起模型级参数**不进服务命令行**（路由器会把自身命令行 merge/覆盖
+    进所有模型），所以断言统一改看 INI 段落。这里把长参数名还原成 ``--xxx``
+    形式，原来那批「参数在不在命令行里」的写法基本能直接复用。
+    """
+    txt = B.preset_section(name, path, snap)
+    got: List[str] = []
+    for ln in txt.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(";"):
+            continue
+        k, sep, v = ln.partition("=")
+        if not sep:
+            got.append(ln)
+            continue
+        k, v = k.strip(), v.strip()
+        got.append(k if k == "model" else "--" + k)
+        got.append(v)
+    return got
+
+
 def run_selftest(app: App, root: tk.Tk) -> List[str]:
     out: List[str] = []
     root.update_idletasks()
@@ -215,13 +240,18 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
         total_rows += n
         mapped = app.pages[page].winfo_ismapped()
         out.append("页面 %-8s 参数 %2d 项  已显示=%s" % (page, n, mapped))
+    # 界面行数 = schema 里所有非 hidden 项 - 弹窗专用页 - 独立页面
+    # （LoRA 有独立页面；models_max 是算出来的 hidden 项；emb_* 在弹窗里）
+    # 该有行的项 = 非 hidden、不在弹窗专用页、不是独立页面（LoRA）
     custom = [f.key for f in S.FIELDS
-              if (f.page, f.section) in
-              {(p_, s_) for p_, secs in S.CUSTOM_SECTIONS.items()
-               for s_ in secs}]
-    out.append("参数总项数：%d 行 + %d 项自定义小节（schema 定义 %d）= %s"
+              if f.page in S.DIALOG_PAGES or f.page == "lora" or f.hidden]
+    _want_rows = [f.key for f in S.FIELDS
+                  if f.key not in custom]
+    _miss_rows = sorted(set(_want_rows) - set(app.rows))
+    out.append("参数总项数：%d 行 + %d 项不进参数页（弹窗/LoRA页/hidden）"
+               "（schema 定义 %d）；漏建行的项=%s"
                % (total_rows, len(custom), len(S.FIELDS),
-                  total_rows + len(custom) == len(S.FIELDS)))
+                  _miss_rows or "无"))
 
     # ---------------- 2. 三种运行模式的命令行
     fake_root = os.path.join(tempfile.gettempdir(), "buun_selftest")
@@ -321,11 +351,11 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
                                      " ".join(argv) or "(空)"))
 
     # ---------------- 4. 服务模式命令行（只有一个角色，一套服务参数）
-    app.assign_role("llm", llm_row["path"], start=False)
+    app.set_target_model(llm_row["path"], start=False)
     role = "llm"
     snap = app.effective_snapshot("server", role)
     argv = B.build_argv(snap, "server",
-                        model=app.store.role_model(role), role=role)
+                        model=app.selected_model, role=role)
     out.append("[服务 %s] %s" % (role, " ".join(argv) or "(空)"))
     # 换一个模型时，命令行里不该再带上 Embedding 专属参数
     out.append("服务命令行不含 embedding 专属 flag=%s"
@@ -358,47 +388,65 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
             row._update_flag_label()
         app.collect("spec")
         s = app.effective_snapshot("server", "llm", llm_row["path"])
-        return s, B.build_argv(s, "server", model=llm_row["path"], role="llm")
+        # 模型级参数（推测解码整页都是 load 作用域）走 INI，不走命令行
+        return s, _ini_tokens("T", llm_row["path"], s)
 
     app.show("spec")
     root.update()
-    snap, argv = _spec_argv("draft-dflash",
+    snap, argv = _spec_argv("DFlash",
                             extra={"spec_draft_n_max": "4",
                                    "spec_draft_p_min": "0.6"})
-    out.append("DFlash 命令行：%s" % " ".join(argv))
+    out.append("DFlash 方式下的模型段：%s" % " ".join(argv))
     st = str(argv[argv.index("--spec-type") + 1]).strip() if \
         "--spec-type" in argv else ""
     out.append("spec-type 是纯类型名（不含冒号/等号）=%s，值=%r"
                % ((":" not in st and "=" not in st), st))
-    out.append("草稿细项走独立 flag=%s"
-               % all(f in argv for f in ("--spec-draft-n-max", "--spec-draft-p-min")))
+    out.append("草稿细项在 INI 里各自独立=%s"
+               % all(f in argv for f in ("--spec-draft-n-max",
+                                         "--spec-draft-p-min")))
 
-    _, argv = _spec_argv("draft-mtp", draft=False)
-    out.append("MTP 命令行：%s" % " ".join(argv))
+    _, argv = _spec_argv("MTP", draft=False)
+    out.append("MTP 方式下的模型段：%s" % " ".join(argv))
     out.append("草稿模型校验（缺草稿 + draft-mtp，应通过）：%s"
                % (B.validate(app.effective_snapshot("server", "llm",
                                                     llm_row["path"]),
                              "server", B.resolve_exe(engine, "server"),
                              model=llm_row["path"], role="llm") or "通过"))
 
-    _, argv = _spec_argv("draft-dflash", draft=False)
-    out.append("草稿模型校验（缺草稿 + draft-dflash，应报错）：%s"
+    _, argv = _spec_argv("DFlash", draft=False)
+    out.append("草稿模型校验（缺草稿 + DFlash，应报错）：%s"
                % [m for _k, m in B.validate(
                    app.effective_snapshot("server", "llm", llm_row["path"]),
                    "server", B.resolve_exe(engine, "server"),
                    model=llm_row["path"], role="llm")])
 
-    _, argv = _spec_argv("ngram-simple,suffix", draft=False,
-                         extra={"spec_ngram_simple_size_n": "16"})
+    # 老配置里存的旧类型名（ngram-simple 之类已被移除）必须被纠正成默认挡位，
+    # 不能原样拼出去 —— 引擎会把不认识的类型名当致命错误。
+    _, argv = _spec_argv("ngram-simple", draft=False,
+                         extra={"spec_mtp_vocab_size": "32768"})
     st2 = str(argv[argv.index("--spec-type") + 1]) if "--spec-type" in argv else ""
-    out.append("逗号列表原样透传=%s（%r）" % (st2 == "ngram-simple,suffix", st2))
+    out.append("旧类型名被纠正成默认挡位=%s（%r）"
+               % (st2 in ("draft-mtp", "draft-dflash", "draft-dspark"), st2))
 
-    _, argv = _spec_argv("dflash:foo=1")
-    out.append("不认识的内联写法被抓出来=%s"
-               % [m for _k, m in B.validate(
-                   app.effective_snapshot("server", "llm", llm_row["path"]),
-                   "server", B.resolve_exe(engine, "server"),
-                   model=llm_row["path"], role="llm")])
+    # MTP 方式 + 一个没有 MTP 头的模型 → 必须报错（引擎只会静默跳过，等于白开）
+    _, _ = _spec_argv("MTP", draft=False)
+    if not llm_row.get("has_mtp"):
+        out.append("MTP 方式 + 模型没有 MTP 头 → 校验报错=%s"
+                   % bool([m for _k, m in B.validate(
+                       app.effective_snapshot("server", "llm",
+                                              llm_row["path"]),
+                       "server", B.resolve_exe(engine, "server"),
+                       model=llm_row["path"], role="llm")]))
+    else:
+        _mtp_other = next((r for r in app.lib_rows
+                           if not r.get("has_mtp")
+                           and r.get("category") == "LLMS"), None)
+        out.append("MTP 方式 + 没有 MTP 头的模型 → 校验报错=%s"
+                   % bool([m for _k, m in B.validate(
+                       app.effective_snapshot("server", "llm",
+                                              (_mtp_other or llm_row)["path"]),
+                       "server", B.resolve_exe(engine, "server"),
+                       model=(_mtp_other or llm_row)["path"], role="llm")]))
 
     app.rows["spec_enable"].on_var.set(False)
     for key in ("spec_type", "model_draft"):
@@ -484,13 +532,15 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     _s["mmproj_gpu_swap"] = {"on": True, "value": ""}
     _s["mmproj_offload"] = {"on": True, "value": "强制关闭"}
     _s["mmproj_device"] = {"on": True, "value": "CUDA0"}
-    _a = B.build_argv(_s, "server", model=llm_row["path"], role="llm")
-    out.append("多模态投影三项都在命令行：%s"
+    _a = _ini_tokens("T", llm_row["path"], _s)
+    # 反向开关在 INI 里写成「键 = false」（引擎 to_args 会换成 --no-xxx）
+    out.append("多模态投影四项都在模型段：%s"
                % all(x in _a for x in ("--mmproj", "--mmproj-gpu-swap",
-                                       "--no-mmproj-offload", "-mmdev")))
-    out.append("  实际片段：%s"
-               % " ".join(a for a in _a
-                          if "mmproj" in a or a == "-mmdev" or a == "CUDA0"))
+                                       "--mmproj-offload", "--mmproj-device")))
+    _mm_lines = [ln for ln in
+                 B.preset_section("T", llm_row["path"], _s).splitlines()
+                 if "mmproj" in ln or "mmdev" in ln]
+    out.append("  实际片段：%s" % _mm_lines)
     _ag = B.build_argv(_s, "gen", model=llm_row["path"], role="llm")
     out.append("生成模式不带 server 专属的 --mmproj-gpu-swap=%s（应 True）"
                % ("--mmproj-gpu-swap" not in _ag))
@@ -544,8 +594,8 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     _s = S.default_snapshot()
     _s["fit_ctx"] = {"on": True, "value": "8192"}
     _s["fit_target"] = {"on": True, "value": "512"}
-    _a = B.build_argv(_s, "server", model=llm_row["path"], role="llm")
-    out.append("fit 参数进命令行=%s（--fit-ctx %s，--fit-target %s）"
+    _a = _ini_tokens("T", llm_row["path"], _s)
+    out.append("fit 参数进模型段=%s（fit-ctx %s，fit-target %s）"
                % ("--fit-ctx" in _a and "--fit-target" in _a,
                   _a[_a.index("--fit-ctx") + 1] if "--fit-ctx" in _a else "-",
                   _a[_a.index("--fit-target") + 1] if "--fit-target" in _a else "-"))
@@ -582,10 +632,31 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     app.collect("chat")
 
     # 推理强度 = 原生 --reasoning-effort（不是 token 上限，也不走模板变量 hack）
+    #
+    # ⚠️ v3.0.0 起：模型级参数（load / chat / emb / LoRA）**不再进服务命令行** ——
+    #    路由器会把自身命令行 merge（覆盖）进每个子模型，所以模型参数只写各自的
+    #    预置 INI 段。断言也跟着改成看 INI 段落；_margs() 把段落拆成 token 并把
+    #    长参数名还原成 --xxx 形式，这样原来那批「参数在不在」的写法照样能用。
+    def _margs(snap: Dict[str, Any]) -> List[str]:
+        txt = B.preset_section("T", llm_row["path"], snap)
+        got: List[str] = []
+        for ln in txt.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith(";"):
+                continue
+            k, sep, v = ln.partition("=")
+            if not sep:
+                got.append(ln)
+                continue
+            k, v = k.strip(), v.strip()
+            got.append(k if k == "model" else "--" + k)
+            got.append(v)
+        return got
+
     def effort_argv(val: str) -> List[str]:
         s2 = app.effective_snapshot("server", "llm", llm_row["path"])
         s2["reasoning_effort"] = {"on": True, "value": val}
-        return B.build_argv(s2, "server", model=llm_row["path"], role="llm")
+        return _margs(s2)
 
     for val in ("minimal", "low", "medium", "high", "xhigh", "max", "不设置"):
         got = [a for a in effort_argv(val) if "reasoning-effort" in a]
@@ -599,19 +670,19 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     s3 = app.effective_snapshot("server", "llm", llm_row["path"])
     s3["reasoning_effort"] = {"on": True, "value": "xhigh"}
     s3["chat_template_kwargs"] = {"on": True, "value": '{"top_k": 3}'}
-    argv3 = B.build_argv(s3, "server", model=llm_row["path"], role="llm")
-    out.append("两处输出各自独立：--reasoning-effort=%s，--chat-template-kwargs=%s"
+    argv3 = _margs(s3)
+    out.append("两处输出各自独立：reasoning-effort=%s，chat-template-kwargs=%s"
                % (argv3[argv3.index("--reasoning-effort") + 1],
                   argv3[argv3.index("--chat-template-kwargs") + 1]))
-    # 挡位改成数字框后，存档里的旧挡位名必须被丢掉（不能变成 --reasoning-budget 不限）
+    # 挡位改成数字框后，存档里的旧挡位名必须被丢掉（不能变成 reasoning-budget 不限）
     s4 = app.effective_snapshot("server", "llm", llm_row["path"])
     s4["reasoning_budget"] = {"on": True, "value": "不限"}
-    argv4 = B.build_argv(s4, "server", model=llm_row["path"], role="llm")
+    argv4 = _margs(s4)
     out.append("旧挡位值「不限」喂给数字项 → 产出=%s（应为空）"
                % [a for a in argv4 if "reasoning-budget" in a])
     s5 = app.effective_snapshot("server", "llm", llm_row["path"])
     s5["reasoning_budget"] = {"on": True, "value": "4096"}
-    argv5 = B.build_argv(s5, "server", model=llm_row["path"], role="llm")
+    argv5 = _margs(s5)
     out.append("思考 token 上限=4096 → %s"
                % " ".join(argv5[argv5.index("--reasoning-budget"):
                                  argv5.index("--reasoning-budget") + 2]))
@@ -625,11 +696,8 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
                % (_h._inject_effort(_body2) == _body2))  # noqa: SLF001
 
     snap = app.effective_snapshot("server", "llm", llm_row["path"])
-    out.append("推理开关展开：%s" % [a for a in
-                                 B.build_argv(snap, "server",
-                                              model=llm_row["path"],
-                                              role="llm")
-                                 if a in ("-rea", "off", "on", "auto")])
+    out.append("推理开关展开：%s" % [a for a in _margs(snap)
+                                 if a in ("--reasoning", "off", "on", "auto")])
 
     # ---------------- 6b2. 参数表里不能留本 build 不认识的参数
     # 真实事故：界面上勾了 -kvu / -a，而用户那份 build 的 --help 里根本没有，
@@ -730,57 +798,233 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
                    % (not sem_bad,
                       "" if not sem_bad else " → " + "；".join(sem_bad[:6])))
 
-    # ---------------- 6b4. 多模型路由
+    # ---------------- 6b4. 多模型路由（v3.0.0 起是唯一的服务方式）
     _rsnap = S.default_snapshot()
-    _rsnap["run_kind"] = {"on": True, "value": S.RUN_ROUTER}
-    _rsnap["models_dir"] = {"on": True, "value": r"E:\LM_models"}
     _rsnap["models_max"] = {"on": True, "value": "3"}
+    _rsnap["models_preset"] = {"on": True,
+                               "value": r"C://x//router-preset.ini"}
+    _rsnap["host"] = {"on": True, "value": "127.0.0.1"}
+    _rsnap["port"] = {"on": True, "value": "1233"}
     _rargv = B.build_argv(_rsnap, "server", model=llm_row["path"], role="llm")
-    out.append("路由模式命令行：%s" % " ".join(_rargv))
-    out.append("路由模式不塞 -m=%s / 带 --models-dir=%s / 带 --models-max=%s"
-               % ("-m" not in _rargv, "--models-dir" in _rargv,
-                  "--models-max" in _rargv))
-    _gsnap = S.default_snapshot()
-    _gargv = B.build_argv(_gsnap, "server", model=llm_row["path"], role="llm")
-    out.append("单模型网关不输出路由参数=%s"
-               % (not any(a in _gargv for a in
-                          ("--models-dir", "--models-max", "--models-preset"))))
+    out.append("路由命令行：%s" % " ".join(_rargv))
+    out.append("路由命令行不塞 -m=%s" % ("-m" not in _rargv))
+    out.append("路由命令行带 --models-preset / --models-max=%s"
+               % ("--models-preset" in _rargv and "--models-max" in _rargv))
+    # ⚠️ 最关键的一条：模型级参数**一个都不能**上路由器命令行。
+    #    路由器会把自身命令行 merge（覆盖）进每个子模型 —— 漏一个上去，
+    #    所有模型就被锁成同一套参数，各自的 INI 段再也改不动。
+    _model_flags = {f.flag for f in S.FIELDS
+                    if f.scope in ("load", "chat", "emb", "lora") and f.flag}
+    _leaked = sorted({a for a in _rargv if a in _model_flags})
+    out.append("路由命令行不含任何模型级参数=%s%s"
+               % (not _leaked, "" if not _leaked else " → 泄漏：" + ", ".join(_leaked)))
+    # 路由只针对 server；对话 / 生成仍是一次性单模型进程，照旧带 -m
+    _cargv = B.build_argv(app.effective_snapshot("cli", "llm", llm_row["path"]),
+                          "cli", model=llm_row["path"])
+    out.append("对话模式仍带 -m=%s" % ("-m" in _cargv))
+    # 没有预置文件 → 校验必须报错（路由起来了也是一个模型都没有）
     _esnap = S.default_snapshot()
-    _esnap["run_kind"] = {"on": True, "value": S.RUN_ROUTER}
-    out.append("路由模式但没有模型来源 → 报错=%s（应=True）"
+    out.append("路由没有预置文件 → 校验报错=%s（应=True）"
                % bool(B.validate(_esnap, "server",
                                  B.resolve_exe(engine, "server"),
                                  model=llm_row["path"], role="llm")))
+
+    # ---- preset INI 的形状
     _ini_snap = S.default_snapshot()
     _ini_snap["ngl"] = {"on": True, "value": "999"}
-    _ini_snap["ct"] = {"on": True, "value": "q8_0"}
     _ini_snap["mlock"] = {"on": True, "value": ""}
-    _ini = B.preset_ini([("模型甲", r"E:\a\x.gguf", _ini_snap),
-                         ("模型乙", r"E:\b\y.gguf", S.default_snapshot())],
-                        S.default_snapshot())
+    _ini = B.preset_ini([("模型甲", llm_row["path"], _ini_snap),
+                         ("模型乙", r"E://b//y.gguf", S.default_snapshot())],
+                        None)
     _secs = [ln for ln in _ini.splitlines() if ln.startswith("[")]
-    out.append("preset INI 段=%s（应 [*] + 两个模型）" % _secs)
-    out.append("preset INI 每段都有 model= =%s"
-               % (_ini.count("model = ") == 2))
-    out.append("preset INI 内部键：%s"
+    out.append("preset INI 段=%s（应 [*] + 两个模型段）" % _secs)
+    out.append("preset INI 每段都有 model= =%s" % (_ini.count("model = ") == 2))
+    out.append("preset INI 模型段内部键：%s"
                % [ln.split("=")[0].strip() for ln in _ini.splitlines()
                   if "=" in ln][:8])
-    if _probe_help:
-        # 最强的守门：INI 里的每个键都必须是本 build 真有的长参数
-        # （否则引擎会抛 "option 'xxx' not recognized in preset" 整个起不来）
-        _longs = set()
-        for _t in _probe_help.values():
-            _longs.update(PR.parse_flags(_t))
-        _badkeys = []
-        for ln in _ini.splitlines():
-            if ln.startswith(("[", ";")) or "=" not in ln:
-                continue
-            _k = ln.split("=")[0].strip()
-            if ("--" + _k) not in _longs:
-                _badkeys.append(_k)
-        out.append("preset INI 的键都是真实长参数=%s%s"
-                   % (not _badkeys,
-                      "" if not _badkeys else " → " + ", ".join(_badkeys)))
+    # [*] 必须空着：它跟命令行一样是全局的，塞模型参数会覆盖全表
+    _star = _ini.split("[*]")[1].split("[")[0]
+    out.append("[*] 全局段为空=%s"
+               % (not [ln for ln in _star.splitlines() if "=" in ln]))
+    # 模型段里不许出现服务进程自己的参数
+    _srv_keys = {f.ini_key for f in S.FIELDS
+                 if f.scope in ("run", "ui") and f.ini_key}
+    _bad_srv = sorted({ln.split("=")[0].strip() for ln in _ini.splitlines()
+                       if "=" in ln and ln.split("=")[0].strip() in _srv_keys})
+    out.append("模型段不含服务级参数=%s%s"
+               % (not _bad_srv,
+                  "" if not _bad_srv else " → " + ", ".join(_bad_srv)))
+    # VBR 闸门在 INI 这条路上也要生效（KV 不是 vbr 就不许写 vbr-*）
+    _ini_v = S.default_snapshot()
+    _ini_v["ct"] = {"on": True, "value": "q8_0"}
+    _ini_vtxt = B.preset_ini([("丁", r"E://d//w.gguf", _ini_v)], None)
+    _has_vbr = any(ln.split("=")[0].strip().startswith("vbr-")
+                   for ln in _ini_vtxt.splitlines() if "=" in ln)
+    out.append("KV 非 vbr 时 INI 里也不写 vbr-* =%s" % (not _has_vbr))
+
+    # ---- 别名：客户端写「文件名」也要能落到对的模型上
+    #
+    # 用户实测报的就是这个：客户端（第三方软件 / 手抄）拿的是**文件名**，
+    # 而路由只认预置文件里的段名 → 400 model '...gguf' not found。
+    _al_name = "显示名跟文件名不一样"
+    _al_lines = [ln for ln in B.preset_section(
+        _al_name, llm_row["path"], S.default_snapshot()).splitlines()
+        if ln.startswith("alias")]
+    _al_want = ",".join(B.preset_aliases(_al_name, llm_row["path"]))
+    out.append("预置段里登记别名=%s → %s" % (bool(_al_lines), _al_lines))
+    out.append("别名同时含「文件名」和「去扩展名的文件名」=%s"
+               % (str(llm_row["file_name"]) in _al_want
+                  and os.path.splitext(str(llm_row["file_name"]))[0] in _al_want))
+    _al_ini = B.preset_ini([(_al_name, llm_row["path"], S.default_snapshot()),
+                            (str(llm_row["file_name"]), llm_row["path"],
+                             S.default_snapshot())], None)
+    out.append("别名跟别的段名撞车时会让出去（不撞车时每个模型一份）=%s"
+               % (_al_ini.count("alias = ") >= 1))
+
+    # ---- 逐模型体检：某个模型的参数不成立时要说清是哪个、为什么
+    _bad_snap = S.default_snapshot()
+    _bad_snap["spec_enable"] = {"on": True, "value": ""}
+    _bad_snap["spec_type"] = {"on": True, "value": "DSpark"}
+    _bad_snap["models_preset"] = {"on": True, "value": r"C://x//p.ini"}
+    _skipped = app._AUDIT_SKIP
+    _bad_errs = [e for e in B.validate(_bad_snap, "server",
+                                       B.resolve_exe(engine, "server"),
+                                       model=llm_row["path"], role="llm")
+                 if e[0] not in _skipped]
+    out.append("DSpark 缺草稿模型 → 体检能报出来=%s（%s）"
+               % (bool(_bad_errs), _bad_errs[0][1].splitlines()[0]
+                  if _bad_errs else "-"))
+    _ok_errs = [e for e in B.validate(
+        dict(_bad_snap, spec_type={"on": True, "value": "MTP"}),
+        "server", B.resolve_exe(engine, "server"),
+        model=llm_row["path"], role="llm") if e[0] not in _skipped]
+    out.append("改成 MTP 后体检干净（该模型带 MTP 头时）=%s"
+               % (not _ok_errs or not llm_row.get("has_mtp")))
+    out.append("体检会忽略服务级项（预置文件 / 端口 / 引擎）=%s"
+               % ("models_preset" in _skipped and "port" in _skipped))
+
+    # ---- 两值参数是禁区（路由初始化会 throw，整个服务起不来）
+    _twov = [f.key for f in S.FIELDS if f.flag in S.TWO_VALUE_FLAGS]
+    out.append("参数表里没有两值参数=%s%s"
+               % (not _twov, "" if not _twov else " → " + ", ".join(_twov)))
+    _tw = S.default_snapshot()
+    _tw["spec_draft_replace"] = {"on": True, "value": "旧 旧"}
+    out.append("两值项就算被塞进快照也不会出现在服务命令行=%s"
+               % (not any(a in S.TWO_VALUE_FLAGS
+                          for a in B.build_argv(_tw, "server",
+                                                model=llm_row["path"]))))
+
+    # ---- MTP 真判据（GGUF 的 {arch}.nextn_predict_layers，不靠文件名猜）
+    _mtp_rows = [r for r in app.lib_rows if r.get("has_mtp")]
+    _nameonly = [r for r in app.lib_rows
+                 if r.get("mtp_name_hint") and not r.get("has_mtp")]
+    out.append("MTP 真判据认出 %d 个带 MTP 头的模型（名字里带 MTP 但实际没有的 %d 个）"
+               % (len(_mtp_rows), len(_nameonly)))
+    if _mtp_rows:
+        _p0 = _mtp_rows[0]["path"]
+        out.append("  · %s → has_mtp=%s nextn_layers=%s"
+                   % (os.path.basename(_p0)[:40], B._model_has_mtp(_p0),
+                      _mtp_rows[0].get("nextn_layers")))
+    # MTP 方式：不该写 -md；DFlash 方式：必须写
+    _sp = S.default_snapshot()
+    _sp["spec_enable"] = {"on": True, "value": ""}
+    _sp["spec_type"] = {"on": True, "value": "MTP"}
+    _sp["model_draft"] = {"on": True, "value": r"E://d//drafter.gguf"}
+    _sp["spec_mtp_vocab_size"] = {"on": True, "value": "32768"}
+    _mtxt = B.preset_section("T", llm_row["path"], _sp)
+    out.append("MTP 方式下不写草稿模型=%s / 写 MTP 词表=%s"
+               % ("model-draft" not in _mtxt, "spec-mtp-vocab-size" in _mtxt))
+    _sp2 = dict(_sp)
+    _sp2["spec_type"] = {"on": True, "value": "DFlash"}
+    _dtxt = B.preset_section("T", llm_row["path"], _sp2)
+    out.append("DFlash 方式下有草稿模型=%s / 不写 MTP 词表=%s"
+               % ("model-draft" in _dtxt, "spec-mtp-vocab-size" not in _dtxt))
+    _sp3 = dict(_sp2)
+    _sp3["spec_type"] = {"on": True, "value": "DSpark"}
+    _sp3["spec_dspark_gpu_assist"] = {"on": True, "value": "强制关闭"}
+    _stxt = B.preset_section("T", llm_row["path"], _sp3)
+    out.append("DSpark 方式下有 GPU 辅助开关=%s"
+               % ("spec-dspark-gpu-assist" in _stxt))
+    out.append("推测方式=单选挡位 %s，映射=%s"
+               % (list(S.SPEC_METHODS),
+                  [S.spec_engine_value(m) for m in S.SPEC_METHODS]))
+
+    # ---- embedding 专属参数与自动纠正
+    out.append("embedding 弹窗参数=%s（应 5 项）"
+               % [f.key for f in S.fields_for("emb")])
+    _emb_rows = [r for r in app.lib_rows if r.get("category") == "Embedding"]
+    if _emb_rows:
+        _ep = _emb_rows[0]["path"]
+        _eg = B.emb_guard(_ep, S.default_snapshot())
+        _ehd, _esrc = B.model_head_dim(_ep)
+        out.append("embedding 模型自动带 --embedding=%s（head_dim=%s）"
+                   % (_eg["emb_enable"]["on"], _ehd))
+        if _ehd and _ehd % 128:
+            out.append("  · head_dim 不是 128 倍数 → KV 已自动钉 f16=%s"
+                       % (_eg["ctv"]["value"] == "f16"))
+        _llm_g = B.emb_guard(llm_row["path"], S.default_snapshot())
+        out.append("对话模型不会被带上 --embedding=%s"
+                   % (not _llm_g["emb_enable"]["on"]))
+    else:
+        out.append("（本次没扫到 embedding 模型，跳过 emb_guard 断言）")
+
+    # ---- LoRA：buun 是单值 CSV 形式，不是上游那种「路径 比例」两值写法
+    _lora = '[{"path":"a.gguf","scale":1.0},{"path":"b.gguf","scale":0.8}]'
+    _largs = B.lora_args(_lora)
+    out.append("LoRA 命令行（CSV 形式）：%s" % _largs)
+    out.append("LoRA 用单值 CSV（--lora a,b / --lora-scaled p:0.8）=%s"
+               % (_largs == ["--lora", "a.gguf",
+                             "--lora-scaled", "b.gguf:0.8"]))
+    _llines = B.lora_ini_lines(_lora)
+    out.append("LoRA 能写进 INI=%s → %s"
+               % (_llines == [("lora", "a.gguf"),
+                              ("lora-scaled", "b.gguf:0.8")], _llines))
+    _lsnap = S.default_snapshot()
+    _lsnap["lora"] = {"on": True, "value": _lora}
+    _ltxt = B.preset_section("T", llm_row["path"], _lsnap)
+    out.append("LoRA 写进模型段（不是命令行）=%s"
+               % ("lora-scaled = b.gguf:0.8" in _ltxt))
+    out.append("LoRA 不进路由器命令行=%s"
+               % (not any(a.startswith("--lora")
+                          for a in B.build_argv(_lsnap, "server",
+                                                model=llm_row["path"]))))
+
+    # ---- 驻留策略 → --models-max
+    _pol_snap = S.default_snapshot()
+    for _k, _v in (("res_llm_max", "1"), ("res_emb_max", "2"),
+                   ("res_llm_idle", "15"), ("res_emb_idle", "30")):
+        _pol_snap[_k] = {"on": True, "value": _v}
+    _d1 = app._derive_residency(dict(_pol_snap))
+    out.append("驻留策略 LLM=1/Emb=2 → --models-max=%s（应 5）"
+               % _d1["models_max"]["value"])
+    _pol_snap["res_emb_uncounted"] = {"on": True, "value": ""}
+    _d2 = app._derive_residency(dict(_pol_snap))
+    out.append("勾「embedding 不计入」→ --models-max=%s（应 0=不限）"
+               % _d2["models_max"]["value"])
+    _pol = ROU.ResidencyPolicy()
+    _pol.llm_max, _pol.emb_max, _pol.emb_uncounted = 1, 2, False
+    out.append("按类上限：LLM=%s Embedding=%s；勾不计入后 Embedding=%s"
+               % (_pol.limit_for("llm"), _pol.limit_for("emb"),
+                  (setattr(_pol, "emb_uncounted", True)
+                   or _pol.limit_for("emb"))))
+
+    # ---- 界面结构：8 个导航页 + 1 个弹窗页，标题不带符号
+    out.append("导航页=%s" % [p_[0] for p_ in S.PAGES])
+    out.append("侧边栏条目=%s"
+               % [x[0] for _g in U.SIDEBAR_GROUPS for x in _g[1]])
+    out.append("侧边栏标题都不带符号=%s"
+               % all(not x[2] for _g in U.SIDEBAR_GROUPS for x in _g[1]))
+    out.append("弹窗专用页=%s（不进侧边栏）=%s"
+               % (list(S.DIALOG_PAGES),
+                  all(p_ not in [x[0] for _g in U.SIDEBAR_GROUPS
+                                 for x in _g[1]] for p_ in S.DIALOG_PAGES)))
+    out.append("LoRA 已是独立页=%s / 不再是「加载参数」的小节=%s"
+               % ("lora" in app.pages, not S.CUSTOM_SECTIONS))
+    out.append("参数项总数=%d" % len(S.FIELDS))
+    out.append("能力列只留多模态/MTP=%s"
+               % (SC.COLUMN_IDS.count("pip") == 1
+                  and not hasattr(SC, "ICO_THINK")
+                  and not hasattr(SC, "ICO_TOOLS")))
 
     # 兜底过滤仍在：合成一份「本 build 只认识这几个 flag」的探测结果，
     # 界面上任何不认识当前 build 的项都必须被剔除、且不误伤核心参数。
@@ -790,8 +1034,10 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     snap_flt["ctx"] = {"on": True, "value": "32768"}
     snap_flt["cram"] = {"on": True, "value": "4096"}
     snap_flt["cache_idle_slots"] = {"on": True, "value": "4"}
-    argv_flt = B.build_argv(snap_flt, "server", model=llm_row["path"],
-                            role="llm", flags=fake_flags)
+    # 用 cli 模式验过滤：server 模式下 -c/-ngl/-t 已经属于模型级参数、
+    # 不进命令行（它们走预置 INI），拿 server 验会误判成「被过滤掉了」
+    argv_flt = B.build_argv(snap_flt, "cli", model=llm_row["path"],
+                            flags=fake_flags)
     left = [a for a in argv_flt
             if a.startswith("-") and a not in fake_flags]
     out.append("不支持的 flag 被剔除：剩余=%s（应为空）" % (left or "无"))
@@ -815,37 +1061,48 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     out.append("跳过提示按 exe 去重=%s"
                % hasattr(app, "_skip_warned"))
 
-    # ---------------- 6c. LoRA 适配器（手动添加路径 + 比例）
-    out.append("LoRA 面板已建=%s 所在自定义小节=%s"
-               % (app.lora_panel is not None,
-                  S.CUSTOM_SECTIONS.get("load")))
+    # ---------------- 6c. LoRA 适配器（独立页面；单值 CSV 形式）
+    out.append("LoRA 已是独立导航页=%s / 不再是「加载参数」的小节=%s"
+               % ("lora" in app.pages, not S.CUSTOM_SECTIONS))
+    out.append("LoRA 面板已建=%s"
+               % (getattr(app, "lora_panel", None) is not None))
     _lora_val = json.dumps([
-        {"path": r"E:\lora\style.safetensors", "scale": 1.0},
-        {"path": r"E:\lora\tone.gguf", "scale": 0.75},
-        {"path": r"E:\lora\neg.gguf", "scale": -0.4}], ensure_ascii=False)
+        {"path": r"E://lora//style.safetensors", "scale": 1.0},
+        {"path": r"E://lora//tone.gguf", "scale": 0.75},
+        {"path": r"E://lora//neg.gguf", "scale": -0.4}], ensure_ascii=False)
     snap_lora = app.effective_snapshot("server", "llm", llm_row["path"])
     snap_lora["lora"] = {"on": True, "value": _lora_val}
-    argv_lora = B.build_argv(snap_lora, "server", model=llm_row["path"],
-                             role="llm")
-    out.append("LoRA 命令行：%s"
-               % " ".join(argv_lora[argv_lora.index("--lora"):]
-                          [:8]))
-    out.append("LoRA 展开正确（1 个 --lora + 2 个 --lora-scaled + 比例）=%s"
-               % (argv_lora.count("--lora") == 1
-                  and argv_lora.count("--lora-scaled") == 2
-                  and "0.75" in argv_lora and "-0.4" in argv_lora))
+    _largs = B.lora_args(_lora_val)
+    out.append("LoRA 命令行（单值 CSV）：%s" % _largs)
+    # buun 的 --lora 是 FNAME（逗号分隔多个）、--lora-scaled 是 FNAME:SCALE,...
+    # **不是**上游那种「--lora-scaled 路径 比例」两值写法 —— 两值写法在路由模式下
+    # 会让整个 llama-server 起不来（common_params_to_map 直接 throw）。
+    out.append("LoRA 用单值 CSV（不是两值）=%s"
+               % (_largs.count("--lora") == 1
+                  and _largs.count("--lora-scaled") == 1
+                  and _largs[1] == r"E://lora//style.safetensors"
+                  and _largs[3] == r"E://lora//tone.gguf:0.75,E://lora//neg.gguf:-0.4"))
+    _ltxt = B.preset_section("T", llm_row["path"], snap_lora)
+    out.append("LoRA 写进模型段：%s"
+               % [ln for ln in _ltxt.splitlines()
+                  if ln.startswith(("lora", "lora-scaled"))])
+    out.append("LoRA 不进路由器命令行=%s"
+               % (not any(a.startswith("--lora")
+                          for a in B.build_argv(snap_lora, "server",
+                                                model=llm_row["path"]))))
     snap_off = app.effective_snapshot("server", "llm", llm_row["path"])
     snap_off["lora"] = {"on": False, "value": _lora_val}
-    out.append("未勾选 LoRA 时完全不传=%s"
-               % (not any("lora" in a for a in
-                          B.build_argv(snap_off, "server",
-                                       model=llm_row["path"], role="llm"))))
+    out.append("未勾选 LoRA 时两处都不出现=%s"
+               % (not any(a.startswith("--lora")
+                          for a in B.build_argv(snap_off, "server",
+                                                model=llm_row["path"]))
+                  and "lora" not in B.preset_section("T", llm_row["path"],
+                                                     snap_off)))
     # 纯文本写法（每行一个路径，行尾可用 | 或 Tab 跟比例）也要认
     out.append("LoRA 文本写法兼容=%s"
                % (B.lora_args("E:/a.gguf\nE:/b.gguf|0.3\nE:/c.gguf\t2")
                   == ["--lora", "E:/a.gguf",
-                      "--lora-scaled", "E:/b.gguf", "0.3",
-                      "--lora-scaled", "E:/c.gguf", "2"]))
+                      "--lora-scaled", "E:/b.gguf:0.3,E:/c.gguf:2"]))
     out.append("空 LoRA 列表不产参数=%s" % (B.lora_args("") == []))
     # 面板列表跟着模型走：写入 → 读回 → 换个模型应该读不到
     app.selected_model = llm_row["path"]
@@ -934,6 +1191,10 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     shutil.rmtree(_cfg, ignore_errors=True)
     os.makedirs(_cfg, exist_ok=True)
     _st = _Store(_cfg)
+    out.append("首次运行就把默认配置落到数据目录=%s（first_run=%s，%s）"
+               % (os.path.isfile(os.path.join(_cfg, "config", "app.json")),
+                  _st.first_run, sorted(os.listdir(os.path.join(_cfg,
+                                                                 "config")))))
     _st.set("engine_path", r"E:\AID\buun-llama-cpp")
     _st.set_pref("show_english", True)
     _a = os.path.join(_cfg, "config", "models", "a.gguf")
@@ -1029,14 +1290,20 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
     out.append("抽样支持判定：%s" % sup)
 
     # ---------------- 9. 控制 API 端到端
-    # 只有一种运行方式：统一端口（一个端口 + 单模型 + 按需切换）
-    out.append("空闲卸载=%s 分钟（统一端口是唯一运行方式）"
-               % app.idle_unload_minutes())
+    # 只有一种运行方式：多模型路由（一个 llama-server 挂 N 个模型子进程）
+    app.sync_residency_policy()
+    out.append("驻留策略：LLM 上限=%s 空闲 %s 分钟 / Embedding 上限=%s"
+               "（不计入=%s）空闲 %s 分钟"
+               % (app.router_policy.llm_max, app.router_policy.llm_idle_min,
+                  app.router_policy.limit_for("emb"),
+                  app.router_policy.emb_uncounted,
+                  app.router_policy.emb_idle_min))
+    out.append("旧的单模型空闲卸载已移除（统一后端不再自己计时）=%s"
+               % (not hasattr(app.unified, "start_idle_watch")))
     app.store.control().update({"enabled": True, "host": "127.0.0.1",
                                 "port": 0, "token": "selftest-token"})
     app.store.role_state("llm")["port"] = {"on": True, "value": "0"}
     app.store.role_state("llm")["host"] = {"on": True, "value": "127.0.0.1"}
-    app.store.role_state("llm")["idle_unload"] = {"on": True, "value": "15"}
     app._sync_gateway(force=True)
     ok, err = app.api.start("127.0.0.1", 0)
     out.append("控制 API 启动：%s %s（端口 %d）" % (ok, err, app.api.port))
@@ -1164,8 +1431,116 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
         threading.Thread(target=stub2.serve_forever, daemon=True).start()
         stub_port2 = int(stub2.server_address[1])
 
-        # ---- 真实唤起：让 API 真的去起一个进程（用 cmd.exe 冒充 llama-server，
-        #      它会立刻报错退出，正好验证「起了进程 + 把失败原因回给调用者」）
+        # ---- 假路由：把桩后端改造成「会记账的路由」
+        #
+        # 真引擎在多模型路由下的接口是：
+        #     GET  /models              每个模型的 id / 别名 / 状态 / 来源
+        #     POST /models/load|unload  {"model": 名字}
+        #     GET  /models?reload=1     重读预置文件
+        # 推理本身还是 /v1/*。桩把这些都实现一遍，自检就能跑完整链路：
+        # 「列名字 → 按名字调用 → 装卸 → 按类限流」。
+        _rt: Dict[str, Any] = {
+            "models": {},          # 正式 id -> {aliases, status, source}
+            "by_alias": {},        # 别名/文件名 -> 正式 id
+            "file": {},            # 正式 id -> 文件名
+            "unloaded": [],        # 记账：被卸过的
+            "loaded": [],          # 记账：被装过的
+        }
+        for _r in rows:
+            _nm = str(_r["name"])
+            _fn = str(_r.get("file_name") or "")
+            _al = [a for a in (os.path.splitext(_fn)[0], _fn)
+                   if a and a != _nm]
+            _rt["models"][_nm] = {"id": _nm, "aliases": _al,
+                                  "status": "unloaded",
+                                  "source": str(_r.get("category") or "")}
+            _rt["file"][_nm] = _fn
+            for _a in _al:
+                _rt["by_alias"][_a] = _nm
+
+        def _rt_lookup(want: str) -> str:
+            """桩自己按「id 或别名」解析 —— 跟引擎的 has_model 行为一致。"""
+            w = str(want or "").strip()
+            if w in _rt["models"]:
+                return w
+            return str(_rt["by_alias"].get(w) or "")
+
+        def _rt_send(handler: Any, payload: bytes, code: int = 200) -> None:
+            handler.send_response(code)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        def _rt_list() -> bytes:
+            data = []
+            for mid, m in _rt["models"].items():
+                data.append({
+                    "id": mid, "aliases": list(m["aliases"]), "tags": [],
+                    "object": "model", "owned_by": "llamacpp",
+                    "created": 1, "source": m["source"], "can_remove": False,
+                    "status": {"value": m["status"]},
+                    "architecture": {"input_modalities": ["text"]},
+                })
+            return json.dumps({"data": data}).encode()
+
+        _orig_get = _Stub.do_GET
+        _orig_post = _Stub.do_POST
+
+        def _rt_get(handler: Any) -> None:      # noqa: N802
+            p0 = handler.path.split("?")[0]
+            if p0 == "/models":
+                _Stub.seen.append((handler.path, None))
+                return _rt_send(handler, _rt_list())
+            if p0.startswith("/v1/models/"):
+                mid = urllib.parse.unquote(p0[len("/v1/models/"):])
+                _Stub.seen.append((handler.path, None))
+                hit = _rt_lookup(mid)
+                return _rt_send(handler, json.dumps({
+                    "id": hit or mid, "object": "model",
+                    "file_name": _rt["file"].get(hit)}).encode())
+            if p0 == "/health":
+                _Stub.seen.append((handler.path, None))
+                return _rt_send(handler, b'{"status":"ok"}')
+            return _orig_get(handler)
+
+        def _rt_post(handler: Any) -> None:     # noqa: N802
+            p0 = handler.path.split("?")[0]
+            if p0 not in ("/models/load", "/models/unload"):
+                return _orig_post(handler)
+            n = int(handler.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(handler.rfile.read(n) or b"{}")
+            except ValueError:
+                body = {}
+            want = str(body.get("model") or "")
+            _Stub.seen.append((handler.path, want))
+            mid = _rt_lookup(want)
+            if not mid:
+                # 引擎就是这么回的：别名/id 都对不上 → 404 not found
+                return _rt_send(handler, json.dumps({"error": {
+                    "message": "model '%s' not found" % want}}).encode(), 404)
+            if p0.endswith("/load"):
+                _rt["models"][mid]["status"] = "loaded"
+                _rt["loaded"].append(mid)
+            else:
+                _rt["models"][mid]["status"] = "unloaded"
+                _rt["unloaded"].append(mid)
+            return _rt_send(handler, b'{"success":true}')
+
+        _Stub.do_GET = _rt_get            # type: ignore[assignment]
+        _Stub.do_POST = _rt_post          # type: ignore[assignment]
+
+        stub2 = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _Stub)
+        stub2.daemon_threads = True
+        threading.Thread(target=stub2.serve_forever, daemon=True).start()
+        stub_port2 = int(stub2.server_address[1])
+
+        # ---- 真起一次进程：拿 cmd.exe 冒充 llama-server
+        #
+        # 验的是新设计最关键的一条：**路由器命令行里不能有任何模型级参数**
+        # （引擎会把路由器自己的命令行 merge/覆盖进每个子模型，漏一个上去，
+        #   所有模型就被锁死成同一套参数）。
         wake_row = next(r for r in rows if r["path"] != llm_row["path"])
         eng2 = os.path.join(fake_root, "engine_cmd")
         os.makedirs(eng2, exist_ok=True)
@@ -1173,37 +1548,33 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
                            "System32", "cmd.exe")
         if os.path.isfile(src):
             shutil.copyfile(src, os.path.join(eng2, "llama-server.exe"))
-            # 这个模型可能是 bert 系（head_dim=64），默认的 vbr 档位会被
-            # 兼容性校验拦住 —— 那样就测不到「真起进程」这一步了。
-            # 显式把 KV 档位设成常规量化，让它走到真正的启动逻辑。
-            for _k in ("ct", "ctk", "ctv"):
-                app.store.snapshot_ref(wake_row["path"], "load")[_k] = {
-                    "on": True, "value": "q8_0"}
-            app.store.snapshot_ref(wake_row["path"], "load")["fa"] = {
-                "on": True, "value": "开启"}
             old_engine = app.engine_var.get()
             app.engine_var.set(eng2)
-            res3: Dict[str, Any] = {}
-            call_bg("/switch", {"model": wake_row["name"]}, res3)
-            out.append("真实唤起（拿 cmd.exe 冒充 llama-server）→ %s"
-                       % {k: str(res3.get(k))[:90]
-                          for k in ("ok", "error", "note")})
-            out.append("确实起了进程且把原因回给了调用者=%s"
-                       % any(w in str(res3.get("error"))
-                             for w in ("进程已退出", "无法启动进程", "超时")))
-            # 顺便验证兼容性校验本身也会把原因回给调用者
-            for _k in ("ct", "ctk", "ctv"):
-                app.store.snapshot_ref(wake_row["path"], "load").pop(_k, None)
-            res4: Dict[str, Any] = {}
-            call_bg("/switch", {"model": wake_row["name"]}, res4)
-            _r4 = str(res4.get("error"))
-            out.append("窄 head_dim 模型被兼容性校验拦住并说明原因=%s"
-                       % (("head_dim" in _r4) or ("128" in _r4)))
-            app.engine_var.set(old_engine)
-            app.unified.clear("")
             app.manager.get("unified").test_running = False
+            res_wake = app.start_unified_backend(wake_row["path"])
+            _wargv = list(getattr(app, "_last_unified_argv", []) or [])
+            _leak = [a for a in _wargv
+                     if a in {f.flag for f in S.FIELDS
+                              if f.scope in ("load", "chat", "emb")
+                              and f.flag}]
+            out.append("真起进程（cmd.exe 冒充 llama-server）→ ok=%s（路由器"
+                       "带 --models-preset=%s / --models-max=%s）"
+                       % (bool(res_wake.get("ok")),
+                          "--models-preset" in _wargv,
+                          "--models-max" in _wargv))
+            out.append("路由器命令行不含任何模型级参数=%s%s"
+                       % (not _leak, "" if not _leak else " → 泄漏：" + str(_leak)))
+            if not res_wake.get("ok"):
+                out.append("  启动失败原因：%s"
+                           % str(res_wake.get("error"))[:200])
+            app.manager.get("unified").test_running = False
+            app.stop_unified_backend()       # 日志 + 清端口 + 卸路由监控
+            app.engine_var.set(old_engine)
+            out.append("停止后端后端口已清空=%s（否则网关会往死端口转发，"
+                       "客户端收到 502 而不是「后端没在运行」）"
+                       % (app.unified.port == 0))
 
-        # ---- 之后用假的启动函数，验证调度/转发/排队/卸载
+        # ---- 之后用假的端口，验证「按名字调用 / 装卸 / 按类限流」
         started: List[Any] = []
 
         def fake_start(path: str, role: str = "") -> Dict[str, Any]:
@@ -1227,27 +1598,158 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
         out.append("GET /health（模型没跑也应为 ok）→ %s"
                    % {k: h.get(k) for k in ("status", "gateway", "ready")})
         vm = call("/v1/models")
-        out.append("统一端口 GET /v1/models → %d 个，active=%s"
-                   % (len(vm["data"]), vm.get("active_model")))
+        _vids = [m["id"] for m in vm["data"]]
+        out.append("GET /v1/models → %d 个，id 就是段名（不含 .gguf）：%s"
+                   % (len(_vids), _vids[:3]))
+        _al0 = vm["data"][0].get("aliases") if vm["data"] else []
+        out.append("列表带别名（客户端写文件名也能用）=%s → %s"
+                   % (bool(_al0), _al0))
+        # 路由起来（桩端口）→ 网关应当纯透传
+        app.manager.get("unified").test_running = True
+        app.manager.get("unified").port = stub_port2
+        app.router.attach(stub_port2)
+        _wake = time.time() + 6.0
+        while time.time() < _wake:
+            if app.router.snapshot()["active"]:
+                break
+            time.sleep(0.1)
+        _snap = app.router.snapshot()
+        out.append("RouterMonitor 轮询 → active=%s，认识 %d 个模型，别名共 %d 个"
+                   % (_snap["active"], len(_snap["models"]),
+                      len(app.router.all_names()) - len(_snap["models"])))
+        # 单个模型的查询用本程序这份（引擎在路由模式下没有这个端点，
+        # 透传只会拿到 404 File Not Found）
+        if vm["data"]:
+            _fn = str(vm["data"][0].get("file_name"))
+            _one = call("/v1/models/%s" % urllib.parse.quote(_fn))
+            out.append("GET /v1/models/<文件名「%s」>（按文件名解析）→ id=%s"
+                       % (_fn, _one.get("id")))
+            out.append("  解析结果就是段名=%s"
+                       % (_one.get("id") == vm["data"][0].get("id")))
 
-        # 请求一个「当前没加载」的模型 → 应自动切换后再转发
+        # 按类限流先放宽，免得它中途把测试用的模型顶掉
+        app.router_policy.llm_max = 8
+        app.router_policy.emb_max = 8
+
         target_row = next(r for r in rows if r["path"] != llm_row["path"])
+        _before = len(_Stub.seen)
         res: Dict[str, Any] = {}
         call_bg("/v1/chat/completions",
                 {"model": target_row["name"], "messages": []}, res)
-        out.append("转发「%s」→ 实际启动=%s 上游收到 model=%s"
-                   % (target_row["name"],
-                      [os.path.basename(p) for p in started],
-                      _Stub.seen[-1][1] if _Stub.seen else None))
-        out.append("返回=%s 后端端口=%s 当前驻留=%s"
-                   % ({k: res.get(k) for k in ("ok", "model", "error")},
-                      app.unified.port,
-                      os.path.basename(app.unified.model or "")))
-        out.append("切换并转发成功=%s（短名已翻译成文件名=%s）"
-                   % (bool(started) and started[-1] == target_row["path"]
-                      and res.get("ok"),
-                      bool(_Stub.seen)
-                      and _Stub.seen[-1][1] == target_row["file_name"]))
+        out.append("按段名调用「%s」→ HTTP=%s，引擎收到 model=%s"
+                   % (target_row["name"], res.get("ok"),
+                      _Stub.seen[-1][1] if len(_Stub.seen) > _before else None))
+        out.append("按段名调用被原样转发=%s（不再自己起进程：%s）"
+                   % (res.get("ok") is True and not started,
+                      "没起任何新进程" if not started else started))
+
+        # 请求里没写 model（有些客户端对单模型服务会省略）→ 补上目标模型
+        app.selected_model = target_row["path"]
+        _before = len(_Stub.seen)
+        res_d: Dict[str, Any] = {}
+        call_bg("/v1/chat/completions", {"messages": []}, res_d)
+        out.append("请求没写 model → 补上界面里的目标模型：HTTP=%s，引擎收到=%s"
+                   % (res_d.get("ok"),
+                      _Stub.seen[-1][1] if len(_Stub.seen) > _before else None))
+
+        # ⭐ 用户报的那个 bug：客户端手里是**文件名**（带 .gguf）
+        _before = len(_Stub.seen)
+        res_f: Dict[str, Any] = {}
+        call_bg("/v1/chat/completions",
+                {"model": target_row["file_name"], "messages": []}, res_f)
+        _sent = _Stub.seen[-1][1] if len(_Stub.seen) > _before else None
+        out.append("按**文件名**调用「%s」→ HTTP=%s，引擎收到 model=%s"
+                   % (target_row["file_name"], res_f.get("ok"), _sent))
+        out.append("文件名被翻成段名=%s（应 True）" % (_sent == target_row["name"]))
+
+        # 去掉扩展名的文件名也该认
+        _before = len(_Stub.seen)
+        res_s: Dict[str, Any] = {}
+        call_bg("/v1/chat/completions",
+                {"model": os.path.splitext(target_row["file_name"])[0],
+                 "messages": []}, res_s)
+        out.append("按「去掉扩展名的文件名」调用 → HTTP=%s，引擎收到=%s"
+                   % (res_s.get("ok"),
+                      _Stub.seen[-1][1] if len(_Stub.seen) > _before else None))
+
+        # 认不出的名字：本程序回 404 并列出候选（不再只扔一句 not found）
+        try:
+            call("/v1/chat/completions", {"model": "根本没有这个模型",
+                                          "messages": []})
+            out.append("调用不存在的模型 → 竟然成功了（应 404）")
+        except Exception as exc:   # noqa: BLE001
+            _eb = err_body(exc)
+            out.append("调用不存在的模型 → HTTP %s，提示带候选名单=%s"
+                       % (getattr(exc, "code", "?"),
+                          ("可选" in _eb) or ("没有叫" in _eb)))
+
+        # ---- 装卸：/models/load|unload 走路由接口，名字同样认文件名
+        _before = len(_Stub.seen)
+        lr = call("/models/load", {"model": target_row["file_name"]})
+        out.append("POST /models/load（用文件名）→ ok=%s，引擎收到=%s"
+                   % (lr.get("ok"),
+                      _Stub.seen[-1][1] if len(_Stub.seen) > _before else None))
+        ur = call("/models/unload", {"model": target_row["name"]})
+        out.append("POST /models/unload → ok=%s，已卸=%s"
+                   % (ur.get("ok"), _rt["unloaded"][-1:] or "-"))
+        try:
+            call("/models/load", {"model": "也是不存在的"})
+            out.append("加载不存在的模型 → 竟然成功了（应 404）")
+        except Exception as exc:   # noqa: BLE001
+            out.append("加载不存在的模型 → 正确 404（HTTP %s）"
+                       % getattr(exc, "code", "?"))
+
+        # ---- 驻留策略：同类超上限 → 顶掉同类里最久没用过的
+        # 只挑 LLMS 类（不能只排 Embedding）：假库里还有 Drafters，
+        # 而草稿模型不算「LLM 驻留名额」（_enforce 按 kind_of 分组时归 "drafter"），
+        # 选进来就会让「2 个 LLM 超上限」根本凑不齐 → 断言假失败。
+        _llms = [str(r["name"]) for r in rows
+                 if r.get("category") == "LLMS"][:2]
+        if len(_llms) == 2:
+            for _i, _nm in enumerate(_llms):
+                _rt["models"][_nm]["status"] = "loaded"
+                app.router.touch(_nm)
+                time.sleep(0.05)          # 拉开 last_used 的顺序
+            _rt["unloaded"].clear()
+            app.router_policy.llm_max = 1
+            app.router_policy.emb_uncounted = False
+            _wake = time.time() + 6.0
+            while time.time() < _wake and not _rt["unloaded"]:
+                time.sleep(0.1)
+            out.append("LLM 上限=1 且同时驻留 2 个 → 自动卸掉=%s（应是更早用的"
+                       "「%s」）" % (_rt["unloaded"] or "（没动静）", _llms[0]))
+            out.append("顶掉的是最久没用过的那个=%s"
+                       % (bool(_rt["unloaded"]) and _rt["unloaded"][0] == _llms[0]))
+        app.router_policy.llm_max = 8
+
+        # ---- 空闲卸载：把 TTL 缩到「立刻」，驻留中的模型应被卸掉
+        _lm = next((str(r["name"]) for r in rows), "")
+        if _lm:
+            _rt["models"][_lm]["status"] = "loaded"
+            app.router.touch(_lm)
+            app.router_policy.llm_idle_min = 0        # 0 = 不限
+            _rt["unloaded"].clear()
+            time.sleep(1.6)
+            out.append("空闲释放设为「不限」→ 不会自动卸=%s"
+                       % (not _rt["unloaded"]))
+            app.router_policy.llm_idle_min = 15
+
+        # ---- 路由没在跑时：不给客户端挂住，尽快回 503
+        app.router.detach()
+        app.manager.get("unified").test_running = False
+        app.manager.get("unified").port = 0
+        _t0 = time.time()
+        try:
+            call("/v1/chat/completions", {"model": target_row["name"],
+                                          "messages": []})
+            out.append("路由没在跑时调用 → 竟然成功了（应 503）")
+        except Exception as exc:   # noqa: BLE001
+            out.append("路由没在跑时调用 → HTTP %s，耗时 %.1fs（自检里不真起"
+                       "进程，应很快返回）"
+                       % (getattr(exc, "code", "?"), time.time() - _t0))
+        app.manager.get("unified").test_running = True
+        app.manager.get("unified").port = stub_port2
+        app.router.attach(stub_port2)
 
         # ---- 运行时状态：轮询桩后端的 /props + /slots，并接收转发回来的 timings
         app.runtime.attach(stub_port2, "stub")
@@ -1267,90 +1769,36 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
                       (_rs["budget_bytes"] or 0) / 1073741824.0))
         out.append("已用比例=%.4f（1234/156672）"
                    % (_rs["used_ratio"] or 0))
-        # 网关转发时抓 timings 的那条路：再发一次，然后看有没有回填
         app.runtime.note_timings(None, None)          # 空数据不许抛异常
-        res2: Dict[str, Any] = {}
         call_bg("/v1/chat/completions",
-                {"model": target_row["name"], "messages": []}, res2)
+                {"model": target_row["name"], "messages": []}, {})
         _rs2 = app.runtime.snapshot()
         out.append("转发一次后抓到速度：生成=%.1f 提示=%.1f t/s（应 261.9/248.8）"
                    % (_rs2.get("gen_tps") or 0, _rs2.get("prompt_tps") or 0))
         out.append("转发后 KV 档位=%s（应 turbo4）" % _rs2.get("kv_tier"))
         out.append("状态条摘要：%s" % app.runtime.summary())
+        out.append("转发过的模型被记了「最后使用时间」=%s"
+                   % (target_row["name"] in getattr(app.router, "_last_used", {})))
         app.runtime.detach()
         out.append("detach 后 attached=%s（应 False）"
                    % app.runtime.snapshot().get("attached"))
 
         st_now = call("/status")["data"]["unified_backend"]
-        out.append("统一后端状态：model=%s ready=%s 切换次数=%s 空闲卸载=%s 分钟"
+        out.append("统一后端状态：model=%s ready=%s 端口=%s"
                    % (os.path.basename(st_now.get("model") or ""),
-                      st_now.get("ready"), st_now.get("switches"),
-                      st_now.get("idle_unload_minutes")))
+                      st_now.get("ready"), st_now.get("port")))
 
-        # 关掉自动切换 → 请求别的模型应 409
-        app.store.role_state("llm")["auto_switch"] = {"on": False, "value": ""}
-        try:
-            call("/v1/chat/completions",
-                 {"model": llm_row["name"], "messages": []})
-            out.append("关闭自动切换后请求别的模型 → 竟然成功了（应 409）")
-        except Exception as exc:  # noqa: BLE001
-            out.append("关闭自动切换后请求别的模型 → 正确拒绝（HTTP %s）"
-                       % getattr(exc, "code", "?"))
-        app.store.role_state("llm")["auto_switch"] = {"on": True, "value": ""}
+        # ---- 重载：重建预置 → 引擎重读 → 把加载过的模型重新装一遍
+        _rt["loaded"].clear()
+        _rt["unloaded"].clear()
+        app.router_history = [target_row["name"]]
+        app.reload_models()
+        out.append("「重载」→ 引擎收到 reload 请求=%s，重新装载=%s"
+                   % (any("reload=1" in str(s[0]) for s in _Stub.seen),
+                      _rt["loaded"]))
+        out.append("重载不重启进程（端口没变）=%s"
+                   % (getattr(app.manager.get("unified"), "port", 0) == stub_port2))
 
-        # 排队：两个并发请求、目标模型不同 → 必须串行切换，不能互相插队
-        seq: List[Any] = []
-
-        def slow_start(path: str) -> Tuple[bool, str]:
-            seq.append(("start", os.path.basename(path)))
-            time.sleep(0.4)
-            st_ = app.manager.get("unified")
-            st_.test_running = True
-            st_.port = stub_port2
-            st_.model = path
-            return True, ""
-
-        def fast_stop() -> None:
-            seq.append(("stop", ""))
-            st_ = app.manager.get("unified")
-            st_.test_running = False
-            st_.model = ""
-
-        app.unified._start_backend = slow_start    # type: ignore[assignment]
-        app.unified._stop_backend = fast_stop      # type: ignore[assignment]
-        app.unified.clear("")
-        r1: Dict[str, Any] = {}
-        r2: Dict[str, Any] = {}
-        a_row, b_row = rows[2], rows[3]
-
-        def hit(path: str, store: Dict[str, Any]) -> None:
-            ok_, msg_ = app.unified.ensure(path, timeout=10)
-            store.update({"ok": ok_, "msg": msg_})
-
-        t1 = threading.Thread(target=hit, args=(a_row["path"], r1))
-        t2 = threading.Thread(target=hit, args=(b_row["path"], r2))
-        t0 = time.time()
-        t1.start()
-        time.sleep(0.1)
-        t2.start()
-        t1.join(timeout=20)
-        t2.join(timeout=20)
-        spent = time.time() - t0
-        out.append("并发两个不同模型：用时 %.1fs（串行应 ≥0.8s），切换序列=%s"
-                   % (spent, seq))
-        out.append("两个请求都成功=%s，最终驻留=%s"
-                   % (bool(r1.get("ok")) and bool(r2.get("ok")),
-                      os.path.basename(app.unified.model or "")))
-        app.unified._start_backend = UnifiedBackend._start_backend  # type: ignore[assignment]
-        app.unified._stop_backend = UnifiedBackend._stop_backend    # type: ignore[assignment]
-        app.unified.clear("")
-        app.manager.get("unified").test_running = False
-
-        # /unload 应把统一后端停掉
-        res2: Dict[str, Any] = {}
-        call_bg("/unload", {}, res2)
-        out.append("POST /unload → ok=%s，后端还在跑=%s"
-                   % (res2.get("ok"), app.manager.get("unified").running))
         stub2.shutdown()
         stub2.server_close()
 
@@ -1365,7 +1813,7 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
         out.append("控制 API 已停止")
 
     # ---------------- 10. 校验逻辑
-    app.store.set_role_model("llm", "")
+    app.selected_model = ""
     snap = app.effective_snapshot("server", "llm", "")
     out.append("无模型时校验：%s"
                % [m for _k, m in B.validate(

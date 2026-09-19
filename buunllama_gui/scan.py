@@ -24,7 +24,7 @@ COLUMNS: Tuple[Tuple[str, str, str, int, str], ...] = (
     ("arch", "架构", "Arch", 104, "w"),
     ("params", "参数量", "Params", 78, "e"),
     ("publisher", "发布者", "Publisher", 104, "w"),
-    ("pip", "能力", "Capabilities", 84, "center"),
+    ("pip", "能力", "Capabilities", 96, "center"),
     ("quant", "量化规格", "Quant", 92, "w"),
     ("size", "尺寸", "Size", 78, "e"),
     ("mtime", "修改日期", "Modified", 116, "center"),
@@ -33,15 +33,19 @@ COLUMNS: Tuple[Tuple[str, str, str, int, str], ...] = (
 
 COLUMN_IDS = tuple(c[0] for c in COLUMNS)
 
-# 三个能力图标（已在 tkinter 中验证可渲染）
-ICO_THINK = "\u25c9"      # ◉
-ICO_VISION = "\u25c8"     # ◈
-ICO_TOOLS = "\u2699"      # ⚙
-ICO_NONE = "\u00b7"       # ·
-ICO_SET = "\u2605"        # ★
+# 「能力」列只显示两个：多模态（能读图）、MTP 预测头。
+# 推理链 / 工具调用那两项用户要求去掉（它们只是聊天模板里的关键字，
+# 对「这个模型能不能这么用」几乎没有指导意义）。
+#
+# ⚠️ 用**文字**而不是符号：原来是 ◈ / ✦ / ·，用户反馈「看不出是什么意思」，
+#    而 · 在表格里只像一粒噪点。现在没有的能力直接**留空**。
+CAP_VISION = "图像"      # 配了多模态投影，能读图
+CAP_MTP = "MTP"          # 带 MTP 预测头，推测方式可以直接选 MTP
+ICO_SET = "\u2605"       # ★ 已单独调参
 
-LEGEND = "%s 推理   %s 多模态   %s 工具调用      %s 已单独调参" % (
-    ICO_THINK, ICO_VISION, ICO_TOOLS, ICO_SET)
+LEGEND = ("图像 = 能读图（带多模态投影）    "
+          "MTP = 带 MTP 预测头（推测解码可直接选 MTP）    "
+          "空白 = 这两项都没有    ★ = 已单独调过参数")
 
 _SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})$")
 
@@ -66,6 +70,10 @@ def classify(path: str, info: Optional[Dict[str, Any]] = None) -> str:
     arch = str((info or {}).get("arch") or "").lower()
     toks = _tokens(path)
     joined = " ".join(toks)
+    # 草稿模型有独立架构 dflash（实测：DSpark / DFlash2 那批全是它），
+    # 这条比名字匹配可靠，所以先判。
+    if arch == "dflash" or (info or {}).get("is_drafter"):
+        return "Drafters"
     if arch in G.ARCH_EMBEDDING:
         return "Embedding"
     if any(t in joined for t in G.NAME_DRAFTER):
@@ -105,6 +113,18 @@ def discover(dirs: Sequence[str], recursive: bool = True, depth: int = 3,
     return out
 
 
+def _info_complete(info: Any) -> bool:
+    """缓存里的 info 是不是「本版本该有的字段都齐」。
+
+    INFO_TAG 忘了 +1 时的第二道保险：缺字段就当缓存无效、重读 GGUF。
+    （踩过：加了 has_mtp 但 tag 没动，于是界面上一个 MTP 都不显示，
+    而直接读 GGUF 又完全正常 —— 这种「只错在缓存路径上」的 bug 极难查。）
+    """
+    if not isinstance(info, dict):
+        return False
+    return all(k in info for k in G.INFO_REQUIRED)
+
+
 def build_row(path: str, info: Dict[str, Any], mmproj: Optional[str],
               params_set: bool, depth: int = 99) -> Dict[str, Any]:
     row = dict(info)
@@ -113,7 +133,10 @@ def build_row(path: str, info: Dict[str, Any], mmproj: Optional[str],
     row["has_vision"] = bool(info.get("has_vision") or mmproj)
     row["category"] = classify(path, info)
     row["params_set"] = ICO_SET if params_set else ""
-    row["mtp_hint"] = any(t in _tokens(path) for t in G.NAME_MTP)
+    # MTP 用 GGUF 里的真值（{arch}.nextn_predict_layers），不再靠文件名猜
+    row["has_mtp"] = bool(info.get("has_mtp"))
+    row["nextn_layers"] = int(info.get("nextn_layers") or 0)
+    row["mtp_name_hint"] = any(t in _tokens(path) for t in G.NAME_MTP)
 
     # 名称 / 发布者优先取目录结构（…\发布者\模型名\xxx.gguf），取不到再退回文件名
     file_name = os.path.basename(path)
@@ -136,11 +159,10 @@ def build_row(path: str, info: Dict[str, Any], mmproj: Optional[str],
         row["name_from_path"] = False
     row["file_name"] = file_name
 
-    row["pip"] = "".join((
-        ICO_THINK if info.get("has_think") else ICO_NONE,
-        ICO_VISION if row["has_vision"] else ICO_NONE,
-        ICO_TOOLS if info.get("has_tools") else ICO_NONE,
-    ))
+    row["pip"] = "   ".join(p for p in (
+        CAP_VISION if row["has_vision"] else "",
+        CAP_MTP if row["has_mtp"] else "",
+    ) if p)          # 都没有 → 空字符串（界面上就是空白）
     row["mtime_text"] = time.strftime(
         "%Y-%m-%d %H:%M", time.localtime(info.get("mtime") or 0))
     row["params_sort"] = int(info.get("params") or 0)
@@ -148,9 +170,8 @@ def build_row(path: str, info: Dict[str, Any], mmproj: Optional[str],
     row["sort_category"] = CATEGORIES.index(row["category"])
     row["sort_arch"] = str(info.get("arch") or "").lower()
     row["sort_publisher"] = str(row["publisher"] or "").lower()
-    row["sort_pip"] = (1 if info.get("has_think") else 0) * 4 + \
-                      (1 if row["has_vision"] else 0) * 2 + \
-                      (1 if info.get("has_tools") else 0)
+    row["sort_pip"] = (1 if row["has_vision"] else 0) * 2 + \
+                      (1 if row["has_mtp"] else 0)
     row["sort_quant"] = str(info.get("quant") or "").lower()
     row["sort_size"] = int(info.get("size") or 0)
     row["sort_mtime"] = float(info.get("mtime") or 0)
@@ -229,11 +250,14 @@ def scan(paths: Iterable[str], mmproj_by_dir: Optional[Dict[str, str]] = None,
             progress(i, len(plist))
         try:
             st = os.stat(path)
-            stamp = "%d:%d" % (int(st.st_mtime), st.st_size)
+            # stamp 里带上缓存格式版本：GGUF 文件本身没变，但 analyse() 的
+            # 返回字段变了（比如这次加的 has_mtp），老缓存会让新字段永远缺席。
+            stamp = "%s:%d:%d" % (G.INFO_TAG, int(st.st_mtime), st.st_size)
         except OSError:
             continue
         entry = cache.get(path)
-        if not (use_cache and entry and entry.get("stamp") == stamp):
+        if not (use_cache and entry and entry.get("stamp") == stamp
+                and _info_complete(entry.get("info"))):
             info = G.analyse(path)
             if not info:
                 continue
@@ -270,12 +294,10 @@ def filter_rows(rows: List[Dict[str, Any]], category: str = "全部",
         out = [r for r in out if r["category"] == want]
     if only_set:
         out = [r for r in out if r.get("params_set")]
-    if cap == "think":
-        out = [r for r in out if r.get("has_think")]
-    elif cap == "vision":
+    if cap == "vision":
         out = [r for r in out if r.get("has_vision")]
-    elif cap == "tools":
-        out = [r for r in out if r.get("has_tools")]
+    elif cap == "mtp":
+        out = [r for r in out if r.get("has_mtp")]
     q = (text or "").strip().lower()
     if q:
         def hit(r):

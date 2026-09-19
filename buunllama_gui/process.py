@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -17,6 +18,27 @@ import urllib.request
 from typing import List, Optional, Sequence
 
 IS_WINDOWS = os.name == "nt"
+
+# --------------------------------------------------------------------------- #
+# 引擎 stdout 里「纯噪音」的行：不进运行日志（也不进诊断用的 out_tail，免得把
+# 真正有用的报错挤出去）。
+#
+# 只匹配**引擎固定格式的原文**，不做宽泛匹配 —— 漏掉一条有用的行，比刷屏糟糕得多。
+# 目前只有一条：多模型路由每次把请求转发给子模型都打一行（server-models.cpp 的
+# `SRV_INF("proxying request to model %s on port %d\n")`），一有请求就成片刷屏：
+#     1.45.595.164 I srv  proxy_reques: proxying request to model X on port 2704
+# --------------------------------------------------------------------------- #
+_NOISE_PATTERNS = (
+    re.compile(r"proxy_reques\w*:\s*proxying request to model\b"),
+    re.compile(r"\bproxying request to model .+ on port \d+"),
+)
+
+
+def is_noise(text: str) -> bool:
+    """这行引擎输出是不是「可以不显示」的噪音。"""
+    if not text:
+        return False
+    return any(rx.search(text) for rx in _NOISE_PATTERNS)
 
 # Windows 进程创建标志
 CREATE_NO_WINDOW = 0x08000000
@@ -139,7 +161,10 @@ class Runner:
         def pump() -> None:
             try:
                 for line in iter(stream.readline, ""):
-                    self.q.put(LogLine(line.rstrip("\r\n"), tag))
+                    text = line.rstrip("\r\n")
+                    if is_noise(text):
+                        continue
+                    self.q.put(LogLine(text, tag))
             except Exception:
                 pass
             finally:

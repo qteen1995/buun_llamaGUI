@@ -15,6 +15,8 @@
   标出能力（多模态 / 工具 / 思考 / 草稿），选中即可加载。
 - **服务**：OpenAI 兼容的 HTTP 服务。对外只有**一个端口**，
   控制 API、`/v1/*`、内置 WebUI 全在这里。
+  一个 llama-server 进程带多个模型子进程（**多模型路由**），各模型可单独加载 / 卸载、
+  互不影响；同时驻留几个、空闲多久自动卸，见「服务」页的**驻留策略**。
 - **对话 / 生成**：终端里跑 `llama-cli`（多轮对话）或 `llama-completion`（一次性生成）。
 - **参数页**：加载参数、对话参数、推测解码（三者都**跟模型走**）；
   服务页（OpenAI 兼容 HTTP）与对话页（llama-cli 多轮 / llama-completion 一次性）各自一套运行参数。
@@ -29,15 +31,19 @@ start_gui_debug.bat         :: 带控制台，方便看报错
 :: 自检（不开窗口，跑一遍核心逻辑，末行 OK）
 E:\Python\Python311\python.exe buun_launcher.pyw --selftest
 
-:: 打包成便携 exe（产物在 dist\）
+:: 打包成便携**单文件** exe（产物 dist\buun_llama_gui.exe，约 10.8 MB）
 E:\Python\Python311\python.exe build_portable.py
+
+:: 需要带控制台的调试版（排查问题用）时加 --debug，会多出一个 buun_llama_gui_debug.exe
+E:\Python\Python311\python.exe build_portable.py --debug
 ```
 
 > 解释器必须是 `E:\Python\Python311\python.exe`（3.11.8，自带 tkinter 8.6）。
 > 托管 Python 3.13 没有 tkinter，跑不了本程序。
 
-配置放在程序目录下的 `config/`——**便携**：不写注册表、不碰 `%APPDATA%`。
-目录不可写时才回退到 `%LOCALAPPDATA%\buun_llama_gui`，原因会写进启动日志。
+配置放在**程序自己所在目录**下的 `config/`——**便携**：不写注册表、不碰 `%APPDATA%`。
+打包成 exe 后取的是 **exe 所在目录**（跟从哪个目录启动无关），而且**首次运行就会生成**。
+只有该目录真的不可写时才回退到 `%LOCALAPPDATA%\buun_llama_gui`，原因会写进启动日志。
 
 ### config 目录长这样
 
@@ -227,15 +233,16 @@ f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq
 ```
 buun_launcher.pyw          入口（双击 / --selftest）
 buunllama_gui/
-  schema.py                参数单一事实来源：122 个参数项、7 个页面、3 个运行模式
+  schema.py                参数单一事实来源：114 个参数项、8 个页面（服务只有「多模型路由」一种跑法）
   engine.py                引擎层：TCQ 码本推导与环境注入、CUDA 运行时依赖体检
-  builder.py               参数 → 命令行、校验（VBR/turbo 约束）、preset INI、.bat
+  builder.py               参数 → 命令行 / 预置 INI、校验（VBR/turbo/推测解码约束）、.bat
   probe.py                 跑 --help 解析当前 build 认哪些 flag
   gguf.py                  GGUF 只读解析（含 head_dim，用于 turbo 档位前置校验）
   runtime.py               运行时状态：轮询 /props + /slots，反查 KV 档位与已用比例
   scan.py                  模型库扫描与分类
   manager.py / process.py  进程生死 + 命令总线（不跨线程碰 tkinter）
-  unified.py               单模型网关的调度（抢锁 / 换模型 / 等就绪 / 空闲卸载）
+  router.py                多模型路由后端：模型清单轮询 / 装卸载 / 按类限流 + 空闲卸载
+  unified.py               路由进程的状态载体（端口 / 是否在跑 / 当前目标模型）
   control_api.py           控制 API + /v1 网关（转发时顺手抓 timings 喂给运行时状态）
   ui.py / widgets.py       界面（含底部运行状态条）
   store.py / theme.py      配置持久化（app.json + 每模型一份）/ 配色

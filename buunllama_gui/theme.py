@@ -83,6 +83,13 @@ def apply(root: tk.Misc) -> ttk.Style:
                     foreground=C["text"], font=FONT_UI_SMALL)
     style.configure("ErrAlt.TLabel", background=C["panel_alt"],
                     foreground=C["err"], font=FONT_UI_SMALL)
+    # 「已加载模型」列表那几个小标签用的（panel_alt 底的次要文字 / 状态色）
+    style.configure("MutedAlt.TLabel", background=C["panel_alt"],
+                    foreground=C["muted"], font=FONT_UI_SMALL)
+    style.configure("OkAlt.TLabel", background=C["panel_alt"],
+                    foreground=C["ok"], font=FONT_UI_SMALL)
+    style.configure("WarnAlt.TLabel", background=C["panel_alt"],
+                    foreground=C["warn"], font=FONT_UI_SMALL)
 
 
     style.configure("Field.TLabel", background=C["bg"], foreground=C["text"])

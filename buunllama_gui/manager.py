@@ -75,6 +75,17 @@ class CommandBus:
             return {"ok": False, "error": "等待主线程执行超时"}
         return req.result
 
+    def post(self, name: str, payload: Dict[str, Any]) -> None:
+        """提交但**不等**结果（fire-and-forget）。
+
+        给「顺手把后端拉起来」这类动作：HTTP 线程不能为了一个后台启停
+        一直挂着；调用方自己轮询端口出现即可。
+        """
+        with self._lock:
+            self._seq += 1
+            rid = self._seq
+        self.q.put(CommandRequest(rid, name, payload or {}))
+
     def drain(self, handler: Callable[[str, Dict[str, Any]], Dict[str, Any]],
               limit: int = 8) -> None:
         for _ in range(limit):
@@ -165,6 +176,10 @@ class Manager:
         st.runner.stop_health_probe()
         st.runner.stop()
         st.loaded_model = ""
+        # 端口也要清掉：UnifiedBackend.port 就是读这里的（status_fn），
+        # 留着旧端口会让网关以为后端还活着 —— 于是把请求转发到一个已经
+        # 关掉的端口，客户端收到 502 而不是「后端没在运行」。
+        st.port = 0
 
     # --------------------------------------------------------- 状态汇总
     def status(self) -> Dict[str, Any]:
@@ -196,7 +211,7 @@ def merge_model_snapshot(store, path: str,
                          ) -> Dict[str, Any]:
     """模型的完整参数 = 默认值 ← 该模型存的加载/对话参数。"""
     snap = defaults if defaults is not None else S.default_snapshot()
-    for scope in ("load", "chat"):
+    for scope in ("load", "chat", "emb"):
         saved = store.state(path, scope)
         if not saved:
             continue
