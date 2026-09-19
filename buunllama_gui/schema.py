@@ -625,7 +625,12 @@ FIELDS: Tuple[F, ...] = (
       on=True, modes=_ALL_RUN, long="ubatch-size",
       hint="物理最大批大小（官方参数名 Physical Batch Size）。\n"
            "实际一次计算的数据块上限，显存峰值主要由它决定。默认 512。\n"
-           "提示词处理偏慢可以适当调大；CUDA OOM 就调小。"),
+           "提示词处理偏慢可以适当调大；CUDA OOM 就调小。\n"
+           "\n"
+           "⚠️ embedding 类模型（向量服务）会被自动抬到\n"
+           "min(4096, 模型训练长度)：向量接口对整段输入**不分块**，\n"
+           "超过它就直接回 input too large（第三方软件传文档必踩）。\n"
+           "想用引擎默认值就把这一项取消勾选（= 不传 -ub）。"),
     F("fa", "快速注意力", "Flash Attention (-fa / --no-fa)", page="load",
       section="perf", flag="-fa", kind=K_GEAR, default="开启",
       choices=("开启", "关闭", "自动"),

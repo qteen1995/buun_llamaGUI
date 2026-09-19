@@ -34,6 +34,25 @@ buun-llama-cpp 控制台 —— 便携版
   "model 'xxx' not found" 猜。
 · 需要调用的模型没在跑时会自动加载，不用先在界面上手动加载（首次要等加载完）。
 
+让第三方软件用向量模型（embedding / RAG）
+------------------------------------------
+· 接口是 /v1/embeddings，模型名同样可以写段名或文件名（别名也认）。
+· 引擎对 embedding 请求**不做分块**：一篇文档切出来的单块 token 数必须 ≤
+  这个模型的「物理批处理大小」，超一条就回
+      input (1008 tokens) is too large to process.
+      increase the physical batch size (current batch size: 512)
+  —— 这正是「唤起模型成功、一喂文档就失败」的原因（短文本能过，文档块过不去）。
+· 启动器会自动把 embedding 模型的 batch / ubatch 抬到
+  min(4096, 模型的训练长度)，所以 embeddinggemma 这类模型开箱就能吃下
+  1000~2000 token 的文档块。生成出来的预置文件里能看到实际值。
+· **模型训练长度是硬顶**：引擎会把上下文压到它（日志里
+  "the slot context ... exceeds the training context of the model ... - capping"）。
+  训练长度 512 的 bge-small-zh-v1.5 无论怎么调都吃不下 1000 token 的块 ——
+  要么在客户端把分块大小（chunk size）调到 512 以下，要么换窗口更大的向量模型
+  （embeddinggemma-300M = 2048、Qwen3-Embedding-0.6B = 32768）。
+  启动时运行日志里会为每个 embedding 模型写明它的可用上限。
+· 想改用引擎默认值：把「加载参数」页的「物理批处理大小」取消勾选即可。
+
 模型库的「能力」列
 ------------------
    图像 = 能读图（配了多模态投影文件 mmproj）

@@ -226,6 +226,29 @@ f16 → turbo8 → turbo4 → turbo3_tcq → turbo2_tcq → turbo1_tcq
 本 build 有 `--reasoning-effort LEVEL`（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），
 请求体里的顶层 `reasoning_effort` 引擎原生支持，网关原样透传。
 
+### 向量模型（embedding）：单块不能超过物理批大小
+
+引擎对 `/v1/embeddings` **不做分块**（`server-task.h` 的 `can_split` 只在
+pooling=last 时为真），输入一超过物理批大小就直接失败：
+
+```
+input (1008 tokens) is too large to process.
+increase the physical batch size (current batch size: 512)
+```
+
+RAG 软件（AnythingLLM / Dify / Cherry Studio / LlamaIndex…）默认把文档切成
+~1000 token 一块，所以默认的 `-ub 512` 会「短文本调得通、一喂文档就崩」。
+`builder.emb_guard()` 因此给 embedding 类模型自动把 `batch-size` / `ubatch-size`
+抬到 `min(4096, 模型训练长度)`（`EMB_MIN_UBATCH`）。三个附带事实：
+
+- **`-ub` 会被引擎压到 `-b`**（实测 `-b 2048 -ub 4096` → 实际 2048），所以抬
+  ub 必须连 b 一起抬。
+- 模型的**训练长度是硬顶**：引擎会把 slot 的 n_ctx 压到它（`the slot context
+  (4096) exceeds the training context of the model (512) - capping`）。
+  训练长度 512 的 bge-small 无论怎么调都吃不下 1000 token 的块 —— 只能让客户端
+  把 chunk size 调小或换模型。启动时 `audit_preset_models()` 会为这类模型写警告。
+- 界面上把「物理批处理大小」**取消勾选**（不传 `-ub`）就完全不自动干预。
+
 ---
 
 ## 代码结构

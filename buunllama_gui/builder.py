@@ -494,6 +494,25 @@ def model_head_dim(model: str) -> Tuple[Optional[int], str]:
             str(info.get("head_dim_src") or ""))
 
 
+def model_ctx_train(model: str) -> Optional[int]:
+    """读 GGUF 里的训练上下文长度（读不出来返回 None）。
+
+    ⚠️ 引擎会把 slot 的 n_ctx **压到这个值**（实测 buun 0.4.1-dev：
+    ``the slot context (4096) exceeds the training context of the model (512)
+    - capping``），所以它同时是「这个模型一次最多能吃多少 token」的硬顶 ——
+    给它设更大的 ``-c`` 没有用。
+    """
+    if not model or not os.path.isfile(model):
+        return None
+    try:
+        from . import gguf as _G          # 延迟导入，避免模块循环
+        info = _G.analyse(model, want_tensors=False) or {}
+    except Exception:                     # noqa: BLE001
+        return None
+    n = info.get("ctx_train")
+    return int(n) if isinstance(n, int) and n > 0 else None
+
+
 def kv_compat_errors(snapshot: Dict[str, Dict[str, Any]],
                      model: str) -> List[Tuple[str, str]]:
     """turbo / TCQ / VBR 档位的前置检查，返回会挡住启动的错误。
@@ -791,9 +810,21 @@ def preset_section(name: str, path: str,
     aliases = preset_aliases(name, path)
     if aliases:
         lines.append("alias = %s" % ",".join(aliases))
-    if is_embedding_model(path):
-        lines.append("; （embedding 类模型：KV 档位已自动钉成 f16）")
     safe = emb_guard(path, snap)
+    if is_embedding_model(path):
+        ub = _emb_batch_int(safe, "ubatch")
+        cap = model_ctx_train(path)
+        note = "; （embedding 类模型：KV 档位已自动钉成 f16"
+        if ub:
+            verb = "只能到" if ub < EMB_MIN_UBATCH else "已抬到"
+            note += "；单次输入上限%s %d tokens" % (verb, ub)
+        lines.append(note + "）")
+        if cap and cap < EMB_MIN_UBATCH:
+            lines.append(";  ⚠️ 它的训练长度只有 %d tokens，引擎会把上下文压到这个值 ——"
+                         % cap)
+            lines.append(";     第三方软件传文档时，切出来的单块不要超过 %d token%s"
+                         % (cap, "，要处理更长的文档请换窗口更大的模型"
+                            if cap < 1024 else "（分块大小在客户端的设置里）"))
     for f in S.FIELDS:
         if f.scope not in ("load", "chat", "emb"):
             continue
@@ -820,7 +851,61 @@ def preset_section(name: str, path: str,
 #    embedding 类模型**天生**要带这个参数（不然它就只是个没用的 bert），
 #    普通对话模型则一定不能带（带上就彻底不能聊天）。所以按 GGUF 架构自动定：
 #    是 embedding 架构 → 强制开；不是 → 强制关并清掉整组 emb 参数。
+# 3) 物理批大小（-ub）必须够大 —— 否则第三方软件一传文档就全灭
+#    引擎对 embedding **不做分块**（server-task.h 的 can_split 只在
+#    pooling=last 时为真），输入一超过物理批大小就直接 send_error：
+#      input (1008 tokens) is too large to process.
+#      increase the physical batch size (current batch size: 512)
+#    而 AnythingLLM / Dify / Cherry Studio / LlamaIndex 这类软件默认把文档
+#    切成 ~1000 token 一块再送 /v1/embeddings —— 默认的 512 必然条条失败
+#    （短文本能过，所以「唤起模型是成功的」，一喂文档就崩）。
+#    ⚠️ 另一个坑：``-ub`` 会被引擎压到 ``-b``（实测 -b 2048 -ub 4096 →
+#    实际 2048），所以抬 ub 必须连 b 一起抬。
 # --------------------------------------------------------------------------- #
+
+# embedding 类模型的「单次输入」下限（token）。见上面第 3 条。
+EMB_MIN_UBATCH = 4096
+
+
+def _emb_batch_int(out: Dict[str, Dict[str, Any]],
+                   key: str) -> Optional[int]:
+    """取快照里某个整数项的当前值（没勾 / 不是数字 → None）。"""
+    st = out.get(key) or {}
+    if not st.get("on"):
+        return None
+    try:
+        v = int(str(st.get("value") or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def emb_raise_batch(model: str, out: Dict[str, Dict[str, Any]]) -> None:
+    """把 embedding 模型的 batch / ubatch 抬到「能吞下一块文档」的量。
+
+    只抬不压：用户自己设的更大值原样保留。上限取
+    ``min(EMB_MIN_UBATCH, 模型训练长度, 用户设的 ctx)`` —— 超过模型训练
+    长度的输入引擎反正会 cap 掉（``... exceeds the training context of the
+    model ... - capping``），抬了也没用。
+
+    **逃生门**：界面上把「物理批处理大小」这项**取消勾选**（= 不传 ``-ub``）
+    就完全不动它 —— 大 embedding 模型 + 小显存时用户可能需要引擎默认值。
+    """
+    st_ub = out.get("ubatch") or {}
+    if st_ub and not st_ub.get("on"):
+        return
+    cap = model_ctx_train(model)
+    limits = [x for x in (cap, _emb_batch_int(out, "ctx")) if x]
+    target = min([EMB_MIN_UBATCH] + limits)
+
+    ub = _emb_batch_int(out, "ubatch")
+    if ub is None or ub < target:
+        out["ubatch"] = {"on": True, "value": str(target)}
+        ub = target
+    b = _emb_batch_int(out, "batch")
+    if b is None or b < ub:
+        out["batch"] = {"on": True, "value": str(ub)}
+
 
 def is_embedding_model(path: str) -> bool:
     """是不是 embedding / reranker 类模型。
@@ -848,6 +933,8 @@ def emb_guard(path: str,
                     out[key] = {"on": True, "value": "f16"}
         if "emb_enable" in out:
             out["emb_enable"] = {"on": True, "value": ""}
+        # 物理批大小抬到能吞下一块文档（第三方软件传文档必需）
+        emb_raise_batch(path, out)
     else:
         # 非 embedding 模型：整组 emb_* 一律关掉（存档里的旧值不算数）
         for f in S.FIELDS:

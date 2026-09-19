@@ -2834,6 +2834,18 @@ class App:
             return
         warned = 0
         for name, model_path, snap in entries:
+            # embedding 的「一次能吃多少」不看参数对不对，看模型自己的训练
+            # 长度 —— 第三方向量软件传文档失败几乎都栽在这条：
+            #   input (1008 tokens) is too large to process
+            if B.is_embedding_model(model_path):
+                _cap = B.model_ctx_train(model_path)
+                if _cap and _cap < B.EMB_MIN_UBATCH:
+                    self.log_append(
+                        "「%s」是 embedding 模型，训练长度只有 %d tokens"
+                        "（引擎会把上下文压到这个值）：第三方软件传文档时，"
+                        "分块必须 ≤%d token，否则报 input too large；"
+                        "要处理更长的文档请换窗口更大的 embedding 模型。"
+                        % (name, _cap, _cap), "warn")
             audit = dict(snap or {})
             if preset_path:
                 audit["models_preset"] = {"on": True, "value": preset_path}

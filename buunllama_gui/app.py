@@ -965,6 +965,35 @@ def run_selftest(app: App, root: tk.Tk) -> List[str]:
         _llm_g = B.emb_guard(llm_row["path"], S.default_snapshot())
         out.append("对话模型不会被带上 --embedding=%s"
                    % (not _llm_g["emb_enable"]["on"]))
+
+        # ---- 物理批大小：embedding 不分块，输入必须 ≤ ub；而 ub 又被引擎压到 b
+        import re as _re
+
+        def _ini_int(txt: str, key: str):
+            m = _re.search(r"^%s\s*=\s*(-?\d+)\s*$" % key, txt, _re.M)
+            return int(m.group(1)) if m else None
+
+        for _r in _emb_rows:
+            _p = _r["path"]
+            _cap = B.model_ctx_train(_p)
+            _want = min([B.EMB_MIN_UBATCH] + ([_cap] if _cap else []))
+            _t = B.preset_section("T", _p, S.default_snapshot())
+            _uv = _ini_int(_t, "ubatch-size")
+            _bv = _ini_int(_t, "batch-size")
+            out.append("「%s」批大小 ub=%s / b=%s（训练长度 %s → 下限 %s）"
+                       % (os.path.basename(_p), _uv, _bv, _cap, _want))
+            out.append("  · ub 已抬到下限=%s，b ≥ ub=%s"
+                       % (_uv == _want,
+                          _bv is not None and _uv is not None and _bv >= _uv))
+        _big = S.default_snapshot()
+        _big["ubatch"] = {"on": True, "value": "8192"}
+        _big["batch"] = {"on": True, "value": "8192"}
+        out.append("用户自己设的更大批大小只抬不压=%s"
+                   % (B.emb_guard(_ep, _big)["ubatch"]["value"] == "8192"))
+        out.append("对话模型的批大小不受影响=%s"
+                   % (_ini_int(B.preset_section("T", llm_row["path"],
+                                                S.default_snapshot()),
+                               "ubatch-size") == 512))
     else:
         out.append("（本次没扫到 embedding 模型，跳过 emb_guard 断言）")
 
